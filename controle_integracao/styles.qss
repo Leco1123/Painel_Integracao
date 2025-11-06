@@ -1,0 +1,18 @@
+QMainWindow, QWidget {
+    background-color: #10121B;
+    color: white;
+    font-family: 'Segoe UI';
+    font-size: 13px;
+}
+QPushButton {
+    background-color: #4ecca3;
+    color: black;
+    font-weight: bold;
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+QPushButton#Danger { background-color: #ff5555; color: white; }
+QPushButton#Secondary { background-color: #2a2f3a; color: white; border: 1px solid #3a3f58; }
+QLabel#Titulo { color: #4ecca3; font-size: 18px; font-weight: bold; }
+QTableWidget { background-color: #1b1e2b; color: white; border: 1px solid #2a2a4a; gridline-color: #2a2a4a; }
+QHeaderView::section { background-color: #2a2f3a; color: white; border: 1px solid #3a3f58; font-weight: bold; }
