@@ -36,22 +36,37 @@ def _build_db_config() -> Dict[str, object]:
         "DB_PORT": "3306",
     }
 
-    missing_values = [key for key in defaults if not os.getenv(key)]
-    for key in missing_values:
-        os.environ.setdefault(key, defaults[key])
+    missing_values = []
+    raw_config: Dict[str, str] = {}
+    for key, default in defaults.items():
+        value = os.environ.get(key)
+        if not value:
+            missing_values.append(key)
+            value = default
+        raw_config[key] = value
 
     if missing_values:
         LOGGER.warning(
-            "Variáveis de ambiente ausentes (%s); usando valores padrão.",
+            "Variáveis de ambiente ausentes ou vazias (%s); usando valores padrão.",
             ", ".join(sorted(missing_values)),
         )
 
+    try:
+        port = int(raw_config["DB_PORT"] or defaults["DB_PORT"])
+    except (TypeError, ValueError):
+        LOGGER.warning(
+            "Valor inválido para DB_PORT (%s); usando %s.",
+            raw_config["DB_PORT"],
+            defaults["DB_PORT"],
+        )
+        port = int(defaults["DB_PORT"])
+
     config: Dict[str, object] = {
-        "host": os.environ["DB_HOST"],
-        "user": os.environ["DB_USER"],
-        "password": os.environ["DB_PASS"],
-        "database": os.environ["DB_NAME"],
-        "port": int(os.environ.get("DB_PORT", defaults["DB_PORT"])),
+        "host": raw_config["DB_HOST"],
+        "user": raw_config["DB_USER"],
+        "password": raw_config["DB_PASS"],
+        "database": raw_config["DB_NAME"],
+        "port": port,
     }
     return config
 
