@@ -1,45 +1,96 @@
+"""Serviços de autenticação e utilidades auxiliares dos painéis."""
+
+from __future__ import annotations
+
 import logging
+from dataclasses import dataclass
+from typing import Optional
 
 import bcrypt
 
 from database import conectar
+from services.produtos_service import ProdutoService
 
 LOGGER = logging.getLogger(__name__)
 
-def verificar_login(usuario, senha):
-    try:
-        with conectar() as conn:
+
+@dataclass(frozen=True)
+class Usuario:
+    id: int
+    usuario: str
+    nome: str
+    tipo: str
+    senha_hash: str
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "usuario": self.usuario,
+            "nome": self.nome,
+            "tipo": self.tipo,
+            "senha_hash": self.senha_hash,
+        }
+
+
+class AuthService:
+    """Executa autenticação de usuários contra a base de dados."""
+
+    def __init__(self, produtos_service: Optional[ProdutoService] = None):
+        self._connection_factory = conectar
+        self._produtos_service = produtos_service or ProdutoService()
+
+    def authenticate(self, username: str, password: str, *, registrar_acesso: bool = True) -> Optional[Usuario]:
+        if not username or not password:
+            raise ValueError("Usuário e senha devem ser preenchidos.")
+
+        with self._connection_factory() as conn:
             cursor = conn.cursor(dictionary=True)
             try:
-                cursor.execute("SELECT * FROM usuarios WHERE usuario = %s", (usuario,))
-                user = cursor.fetchone()
+                cursor.execute("SELECT * FROM usuarios WHERE usuario = %s", (username,))
+                row = cursor.fetchone()
             finally:
                 cursor.close()
 
-        if user and bcrypt.checkpw(senha.encode("utf-8"), user["senha_hash"].encode("utf-8")):
-            registrar_acesso(user["usuario"])
-            return user
-    except Exception:
-        LOGGER.exception("Erro ao verificar login do usuário '%s'", usuario)
-        raise
+        if not row:
+            return None
 
-    return None
+        senha_hash = row.get("senha_hash") or ""
+        if not isinstance(senha_hash, str) or not senha_hash:
+            LOGGER.warning("Usuário '%s' não possui hash de senha cadastrado.", username)
+            return None
 
-def registrar_acesso(usuario):
-    """Atualiza o último acesso de todos os produtos e registra o log."""
+        if not bcrypt.checkpw(password.encode("utf-8"), senha_hash.encode("utf-8")):
+            return None
 
-    try:
-        with conectar() as conn:
-            cursor = conn.cursor()
+        usuario = Usuario(
+            id=row.get("id", 0),
+            usuario=row.get("usuario", ""),
+            nome=row.get("nome", ""),
+            tipo=row.get("tipo", "usuario"),
+            senha_hash=senha_hash,
+        )
+
+        if registrar_acesso:
             try:
-                cursor.execute("UPDATE produtos SET ultimo_acesso = NOW()")
-                cursor.execute(
-                    "INSERT INTO acessos (usuario, produto_id) SELECT %s, id FROM produtos",
-                    (usuario,),
+                self._produtos_service.registrar_acesso_global(usuario.usuario)
+            except Exception:
+                LOGGER.exception(
+                    "Falha ao registrar acesso global para o usuário '%s'", usuario.usuario
                 )
-                conn.commit()
-            finally:
-                cursor.close()
-    except Exception:
-        LOGGER.exception("Erro ao registrar acesso em massa do usuário '%s'", usuario)
-        raise
+
+        return usuario
+
+
+def verificar_login(usuario: str, senha: str) -> Optional[dict]:
+    """Mantido por compatibilidade com código legado."""
+
+    service = AuthService()
+    autenticado = service.authenticate(usuario, senha)
+    return autenticado.to_dict() if autenticado else None
+
+
+def registrar_acesso(usuario: str) -> None:
+    ProdutoService().registrar_acesso_global(usuario)
+
+
+__all__ = ["AuthService", "Usuario", "verificar_login", "registrar_acesso"]

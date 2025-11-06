@@ -1,28 +1,38 @@
-from PySide6 import QtWidgets, QtCore
+"""Painel destinado aos usuários finais com consulta periódica dos produtos."""
 
-from painel_base import BasePainelCards
+from __future__ import annotations
+
+from PySide6 import QtCore, QtWidgets
+
+from controle_integracao.controle_integracao import ControleIntegracao
 from manuais_bridge import abrir_manuais_via_qt
-from controle_integracao.controle_integracao import ControleIntegracao  # 🔗 integração total
-from services.produtos_service import obter_produtos_principais, registrar_acesso_produto
+from painel_base import BasePainelWindow, PainelCard
+from services.produtos_service import Produto, ProdutoService
 
 
-class PainelUser(BasePainelCards):
-    def __init__(self, user):
+class PainelUser(BasePainelWindow):
+    REFRESH_INTERVAL_MS = 3000
+
+    def __init__(self, user: dict):
         super().__init__(user, "Painel do Usuário")
-        self.logger.info("Painel do Usuário inicializado para %s", self.user["usuario"])
-        self._preencher_cards()
+        self._service = ProdutoService()
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(self.REFRESH_INTERVAL_MS)
+        self._timer.timeout.connect(self._refresh_produtos)
 
-        # Atualização automática dos cards
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self._preencher_cards)
-        self.timer.start(3000)
+        self.logger.info("Painel do Usuário inicializado para %s", self.user.get("usuario"))
+        self._janela_integracao = None
+        self._refresh_produtos()
+        self._timer.start()
 
-    # ===============================================================
-    # Atualiza os cards
-    # ===============================================================
-    def _preencher_cards(self):
+    def criar_card(self, produto: Produto) -> PainelCard:
+        card = super().criar_card(produto)
+        card.activated.connect(self._abrir_modulo)
+        return card
+
+    def _refresh_produtos(self) -> None:
         try:
-            produtos = obter_produtos_principais()
+            produtos = self._service.listar_principais()
         except Exception as exc:
             self.logger.exception("Falha ao carregar produtos no painel do usuário.")
             QtWidgets.QMessageBox.critical(
@@ -30,88 +40,38 @@ class PainelUser(BasePainelCards):
                 "Erro ao buscar produtos",
                 f"Não foi possível carregar os produtos:\n{exc}",
             )
-            produtos = []
-
-        self.preencher_grade(produtos, self._criar_card)
-
-    # ===============================================================
-    # Criação dos cards
-    # ===============================================================
-    def _criar_card(self, produto):
-        frame = QtWidgets.QFrame()
-        frame.setObjectName("Card")
-        lay = QtWidgets.QVBoxLayout(frame)
-        lay.setSpacing(6)
-
-        # Nome
-        lbl_nome = QtWidgets.QLabel(produto["nome"])
-        lbl_nome.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff;")
-        lay.addWidget(lbl_nome)
-
-        # Status
-        status_texto = produto["status"] or "Desconhecido"
-        cor_status = {
-            "Em Desenvolvimento": "#ff5555",
-            "Atualizando": "#ffaa00",
-            "Pronto": "#4ecca3",
-        }.get(status_texto, "#888888")
-
-        lbl_status = QtWidgets.QLabel(f"Status: {status_texto}")
-        lbl_status.setObjectName("StatusLabel")
-        lbl_status.setStyleSheet(f"color: {cor_status}; font-weight:bold;")
-        lay.addWidget(lbl_status)
-
-        # Último acesso
-        lbl_acesso = QtWidgets.QLabel(
-            f"Último acesso: {self.formatar_data(produto.get('ultimo_acesso'))}"
-        )
-        lay.addWidget(lbl_acesso)
-
-        # Botão
-        btn_abrir = QtWidgets.QPushButton("Abrir")
-        status_norm = status_texto.strip().lower()
-
-        if status_norm != "pronto":
-            btn_abrir.setEnabled(False)
-            btn_abrir.setStyleSheet("background-color:#ff5555; color:white; border-radius:6px; padding:6px;")
-        else:
-            btn_abrir.setStyleSheet(f"background-color:{cor_status}; color:black; border-radius:6px; padding:6px;")
-
-        btn_abrir.clicked.connect(lambda _, p=produto: self._abrir_modulo(p))
-        lay.addWidget(btn_abrir)
-        return frame
-
-    # ===============================================================
-    # Roteamento dos módulos
-    # ===============================================================
-    def _abrir_modulo(self, produto):
-        nome_modulo = produto["nome"]
-        status_modulo = (produto["status"] or "").strip().lower()
-        self.logger.info("Usuário solicitou módulo '%s' (status=%s)", nome_modulo, status_modulo)
-
-        # Log de acesso
-        try:
-            registrar_acesso_produto(produto["id"], self.user["usuario"])
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao registrar acesso:\n{e}")
-            self.logger.exception(
-                "Falha ao registrar acesso do usuário %s ao produto %s",
-                self.user["usuario"],
-                produto.get("id"),
-            )
             return
 
-        # Abre os módulos
-        if nome_modulo == "Manuais":
+        self.renderizar_produtos(produtos)
+
+    def _abrir_modulo(self, produto: Produto) -> None:
+        nome = produto.nome
+        self.logger.info("Usuário acionou módulo %s", nome)
+
+        if produto.id is not None:
+            try:
+                self._service.registrar_acesso(produto.id, self.user.get("usuario", ""))
+            except Exception:
+                self.logger.exception(
+                    "Falha ao registrar acesso do usuário %s ao produto %s",
+                    self.user.get("usuario"),
+                    produto.id,
+                )
+                return
+
+        if nome == "Manuais":
             abrir_manuais_via_qt(self)
-            return
+        elif nome == "Controle da Integração":
+            janela = ControleIntegracao(self.user)
+            janela.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+            janela.show()
+            self._janela_integracao = janela
+        else:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Módulo não disponível",
+                f"O módulo '{nome}' ainda não foi conectado.",
+            )
 
-        if nome_modulo == "Controle da Integração":
-            self.janela_integracao = ControleIntegracao(self.user)
-            self.janela_integracao.show()
-            return
 
-        QtWidgets.QMessageBox.information(
-            self, "Ainda não implementado",
-            f"O módulo '{nome_modulo}' ainda não foi conectado."
-        )
+__all__ = ["PainelUser"]

@@ -1,175 +1,559 @@
-# Código pronto para implementação
-Este arquivo reúne as versões completas dos módulos principais após as melhorias.
-Copie cada trecho para o arquivo correspondente no projeto caso esteja aplicando as
-alterações manualmente.
+# Código para implementação (versão reescrita)
 
-> **Dica:** Antes de substituir qualquer arquivo, faça um backup/local commit para
-> garantir que seja possível voltar atrás se necessário.
+Este documento reúne os principais módulos reescritos da aplicação para facilitar a cópia e a verificação manual das alterações.
 
----
+## database.py
 
-## `database.py`
 ```python
-# database.py
+"""Infraestrutura de acesso ao banco de dados MySQL utilizada pelos painéis."""
+
+from __future__ import annotations
+
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, Optional
 
 from mysql.connector import Error, pooling
 
 LOGGER = logging.getLogger(__name__)
 
-
-def _load_dotenv() -> None:
-    """Carrega um arquivo .env localizado ao lado do projeto, se existir."""
-    env_path = Path(__file__).resolve().parent / ".env"
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+_ENV_FILE_CANDIDATES: Iterable[Path] = (
+    Path(__file__).resolve().parent / ".env",
+    Path(__file__).resolve().parent.parent / ".env",
+)
 
 
-def _build_db_config() -> Dict[str, object]:
-    _load_dotenv()
+@dataclass(frozen=True)
+class DatabaseSettings:
+    """Representa a configuração necessária para montar o pool de conexões."""
 
-    defaults = {
-        "DB_HOST": "localhost",
-        "DB_USER": "root",
-        "DB_PASS": "int123!",
-        "DB_NAME": "sistema_login",
-        "DB_PORT": "3306",
-    }
+    host: str = "localhost"
+    port: int = 3306
+    user: str = "root"
+    password: str = "int123!"
+    database: str = "sistema_login"
 
-    missing_values = [key for key in defaults if not os.getenv(key)]
-    for key in missing_values:
-        os.environ.setdefault(key, defaults[key])
+    @classmethod
+    def load(cls) -> "DatabaseSettings":
+        """Carrega as configurações a partir do ambiente e de arquivos ``.env``."""
 
-    if missing_values:
-        LOGGER.warning(
-            "Variáveis de ambiente ausentes (%s); usando valores padrão.",
-            ", ".join(sorted(missing_values)),
+        env_file_values = _load_env_files()
+        for key, value in env_file_values.items():
+            os.environ.setdefault(key, value)
+
+        merged: Dict[str, Optional[str]] = {
+            "DB_HOST": cls.host,
+            "DB_USER": cls.user,
+            "DB_PASS": cls.password,
+            "DB_NAME": cls.database,
+            "DB_PORT": str(cls.port),
+        }
+        for key in merged.keys():
+            value = os.environ.get(key)
+            if value:
+                merged[key] = value
+
+        missing = [key for key in ("DB_HOST", "DB_USER", "DB_PASS", "DB_NAME") if not merged.get(key)]
+        if missing:
+            LOGGER.warning(
+                "Variáveis de ambiente não fornecidas: %s. Utilizando valores padrão.",
+                ", ".join(missing),
+            )
+
+        try:
+            port = int(merged["DB_PORT"])
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "Valor inválido para DB_PORT (%s); utilizando %s.",
+                merged.get("DB_PORT"),
+                cls.port,
+            )
+            port = cls.port
+
+        return cls(
+            host=str(merged["DB_HOST"]),
+            user=str(merged["DB_USER"]),
+            password=str(merged["DB_PASS"]),
+            database=str(merged["DB_NAME"]),
+            port=port,
         )
 
-    config: Dict[str, object] = {
-        "host": os.environ["DB_HOST"],
-        "user": os.environ["DB_USER"],
-        "password": os.environ["DB_PASS"],
-        "database": os.environ["DB_NAME"],
-        "port": int(os.environ.get("DB_PORT", defaults["DB_PORT"])),
-    }
-    return config
+    def to_mysql_kwargs(self) -> Dict[str, object]:
+        return {
+            "host": self.host,
+            "user": self.user,
+            "password": self.password,
+            "database": self.database,
+            "port": self.port,
+        }
 
 
-DB_CONFIG = _build_db_config()
+def _load_env_files() -> Dict[str, str]:
+    """Retorna um dicionário com valores extraídos de eventuais arquivos ``.env``."""
+
+    data: Dict[str, str] = {}
+    for path in _ENV_FILE_CANDIDATES:
+        if not path or not path.exists():
+            continue
+        try:
+            for raw_line in path.read_text().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                data.setdefault(key.strip(), value.strip())
+        except OSError as exc:
+            LOGGER.debug("Não foi possível ler %s: %s", path, exc)
+    return data
 
 
-# -----------------------------------------
-# Pool
-# -----------------------------------------
-try:
-    _POOL = pooling.MySQLConnectionPool(
-        pool_name="painel_pool",
-        pool_size=5,
-        pool_reset_session=True,
-        **DB_CONFIG,
-    )
-    LOGGER.info("Pool de conexões iniciado com sucesso.")
-except Error as exc:
-    LOGGER.exception("Falha ao criar pool de conexões.")
-    _POOL = None
+class _ConnectionHandle:
+    """Proxy amigável que funciona tanto com ``with`` quanto em uso direto."""
 
-
-# -----------------------------------------
-# Proxy que funciona com e sem 'with'
-# -----------------------------------------
-class _ConnectionProxy:
-    """
-    - Suporta uso com 'with conectar() as conn'
-    - Suporta uso direto: conn = conectar(); conn.cursor()
-    - Encaminha atributos para a conexão real (lazy)
-    """
-    def __init__(self, pool):
+    def __init__(self, pool: Optional[pooling.MySQLConnectionPool]):
         self._pool = pool
         self._conn = None
 
-    def _ensure(self):
+    def _ensure_connection(self):
         if self._conn is None:
             if not self._pool:
                 raise RuntimeError("Pool de conexões não inicializado.")
             self._conn = self._pool.get_connection()
-
-    # Context manager
-    def __enter__(self):
-        self._ensure()
         return self._conn
 
+    # API compatível com ``with conectar() as conn``
+    def __enter__(self):
+        return self._ensure_connection()
+
     def __exit__(self, exc_type, exc, tb):
-        try:
-            if self._conn and self._conn.is_connected():
-                self._conn.close()  # devolve ao pool
-        finally:
-            self._conn = None
+        self.close()
+        return False
 
-    # Encaminha qualquer atributo/método para a conexão real
-    def __getattr__(self, name):
-        self._ensure()
-        return getattr(self._conn, name)
+    # Encaminhamento para o objeto real
+    def __getattr__(self, item):
+        connection = self._ensure_connection()
+        return getattr(connection, item)
 
-    # Para casos como: if conn: ...
     def __bool__(self):
-        self._ensure()
-        return bool(self._conn)
+        return self._conn is not None
+
+    def close(self):
+        if self._conn is not None:
+            try:
+                if self._conn.is_connected():
+                    self._conn.close()
+            finally:
+                self._conn = None
 
 
-# -----------------------------------------
-# API pública
-# -----------------------------------------
-def conectar():
-    """
-    Retorna um proxy de conexão.
-    Pode ser usado de duas formas:
+SETTINGS = DatabaseSettings.load()
 
-        # 1) Context manager (recomendado)
-        with conectar() as conn:
-            cur = conn.cursor(dictionary=True)
-            cur.execute("SELECT 1")
-            conn.commit()
+try:
+    _POOL: Optional[pooling.MySQLConnectionPool] = pooling.MySQLConnectionPool(
+        pool_name="painel_pool",
+        pool_reset_session=True,
+        pool_size=5,
+        **SETTINGS.to_mysql_kwargs(),
+    )
+    LOGGER.info(
+        "Pool de conexões criado: %s@%s:%s/%s",
+        SETTINGS.user,
+        SETTINGS.host,
+        SETTINGS.port,
+        SETTINGS.database,
+    )
+except Error:
+    LOGGER.exception("Falha ao inicializar o pool de conexões com o MySQL.")
+    _POOL = None
 
-        # 2) Direto (compatibilidade)
-        conn = conectar()
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        conn.commit()
-        conn.close()
-    """
-    return _ConnectionProxy(_POOL)
+
+def conectar() -> _ConnectionHandle:
+    """Retorna um proxy de conexão reutilizável."""
+
+    return _ConnectionHandle(_POOL)
+
+
+__all__ = ["SETTINGS", "conectar", "DatabaseSettings"]
 
 ```
 
-## `painel_base.py`
+## services/produtos_service.py
+
 ```python
+"""Serviço de domínio responsável pela gestão dos produtos exibidos nos painéis."""
+
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Iterable, List, Optional, Sequence
 
-from PySide6 import QtWidgets
-from PySide6.QtCore import Qt
+from mysql.connector.cursor import MySQLCursor, MySQLCursorDict
+
+from database import conectar
+
+LOGGER = logging.getLogger(__name__)
+
+_DEFAULT_PRODUCTS: Sequence[str] = (
+    "Controle da Integração",
+    "Macro da Regina",
+    "Macro da Folha",
+    "Macro do Fiscal",
+    "Formatador de Balancete",
+    "Manuais",
+)
+
+_STATUS_ORDER = "", "Em Desenvolvimento", "Atualizando", "Pronto"
 
 
-class BasePainelCards(QtWidgets.QMainWindow):
-    """Janela base com layout e estilo compartilhados pelos painéis."""
+@dataclass
+class Produto:
+    id: Optional[int]
+    nome: str
+    status: str
+    ultimo_acesso: Optional[datetime]
+
+    @property
+    def cache_key(self) -> str:
+        return f"{self.id or 'virtual'}::{self.nome}"
+
+    @classmethod
+    def from_row(cls, row: dict) -> "Produto":
+        ultimo_acesso = row.get("ultimo_acesso")
+        if isinstance(ultimo_acesso, str) and ultimo_acesso:
+            try:
+                ultimo_acesso = datetime.fromisoformat(ultimo_acesso.replace("Z", ""))
+            except ValueError:
+                ultimo_acesso = None
+        return cls(
+            id=row.get("id"),
+            nome=row.get("nome", ""),
+            status=row.get("status") or "Desconhecido",
+            ultimo_acesso=ultimo_acesso,
+        )
+
+
+class ProdutoService:
+    """API de alto nível para operações relacionadas aos produtos."""
+
+    def __init__(self):
+        self._connection_factory = conectar
+
+    # ---------------------------------------------------------------
+    # Leitura
+    # ---------------------------------------------------------------
+    def listar_principais(self) -> List[Produto]:
+        with self._connection_factory() as conn:
+            cursor: MySQLCursorDict = conn.cursor(dictionary=True)
+            try:
+                cursor.execute(
+                    """
+                    SELECT id, nome, status, ultimo_acesso
+                    FROM produtos
+                    WHERE nome IN (%s, %s, %s, %s, %s, %s)
+                    ORDER BY FIELD(
+                        nome,
+                        %s, %s, %s, %s, %s, %s
+                    )
+                    """,
+                    tuple(_DEFAULT_PRODUCTS) * 2,
+                )
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
+
+            produtos = [Produto.from_row(row) for row in rows]
+            faltantes = [nome for nome in _DEFAULT_PRODUCTS if nome not in {p.nome for p in produtos}]
+            if faltantes:
+                LOGGER.info("Inserindo produtos padrão ausentes: %s", ", ".join(faltantes))
+                self._criar_produtos(faltantes)
+                return self.listar_principais()
+            return produtos
+
+    # ---------------------------------------------------------------
+    # Escrita
+    # ---------------------------------------------------------------
+    def registrar_acesso(self, produto_id: int, usuario: str) -> None:
+        if produto_id is None:
+            raise ValueError("produto_id deve ser informado")
+
+        with self._connection_factory() as conn:
+            cursor: MySQLCursor = conn.cursor()
+            try:
+                cursor.execute("UPDATE produtos SET ultimo_acesso = NOW() WHERE id = %s", (produto_id,))
+                cursor.execute(
+                    "INSERT INTO acessos (usuario, produto_id) VALUES (%s, %s)",
+                    (usuario, produto_id),
+                )
+                conn.commit()
+            finally:
+                cursor.close()
+
+    def registrar_acesso_global(self, usuario: str) -> None:
+        """Marca o último acesso para todos os produtos disponíveis."""
+
+        with self._connection_factory() as conn:
+            cursor: MySQLCursor = conn.cursor()
+            try:
+                cursor.execute("UPDATE produtos SET ultimo_acesso = NOW()")
+                cursor.execute(
+                    "INSERT INTO acessos (usuario, produto_id) SELECT %s, id FROM produtos",
+                    (usuario,),
+                )
+                conn.commit()
+            finally:
+                cursor.close()
+
+    def atualizar_status(self, produto_id: int, novo_status: str) -> None:
+        if produto_id is None:
+            raise ValueError("produto_id deve ser informado")
+
+        status_normalizado = novo_status.strip()
+        if status_normalizado not in _STATUS_ORDER:
+            LOGGER.warning("Status inválido '%s' fornecido; aplicando valor literal.", novo_status)
+
+        with self._connection_factory() as conn:
+            cursor: MySQLCursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE produtos SET status = %s WHERE id = %s",
+                    (status_normalizado, produto_id),
+                )
+                conn.commit()
+            finally:
+                cursor.close()
+
+    # ---------------------------------------------------------------
+    # Internos
+    # ---------------------------------------------------------------
+    def _criar_produtos(self, nomes: Iterable[str]) -> None:
+        valores = [(nome,) for nome in nomes]
+        if not valores:
+            return
+
+        with self._connection_factory() as conn:
+            cursor: MySQLCursor = conn.cursor()
+            try:
+                cursor.executemany(
+                    "INSERT IGNORE INTO produtos (nome, status, ultimo_acesso) VALUES (%s, 'Pronto', NULL)",
+                    valores,
+                )
+                conn.commit()
+            finally:
+                cursor.close()
+
+
+__all__ = ["Produto", "ProdutoService", "_DEFAULT_PRODUCTS"]
+
+```
+
+## utils.py
+
+```python
+"""Serviços de autenticação e utilidades auxiliares dos painéis."""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+import bcrypt
+
+from database import conectar
+from services.produtos_service import ProdutoService
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Usuario:
+    id: int
+    usuario: str
+    nome: str
+    tipo: str
+    senha_hash: str
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "usuario": self.usuario,
+            "nome": self.nome,
+            "tipo": self.tipo,
+            "senha_hash": self.senha_hash,
+        }
+
+
+class AuthService:
+    """Executa autenticação de usuários contra a base de dados."""
+
+    def __init__(self, produtos_service: Optional[ProdutoService] = None):
+        self._connection_factory = conectar
+        self._produtos_service = produtos_service or ProdutoService()
+
+    def authenticate(self, username: str, password: str, *, registrar_acesso: bool = True) -> Optional[Usuario]:
+        if not username or not password:
+            raise ValueError("Usuário e senha devem ser preenchidos.")
+
+        with self._connection_factory() as conn:
+            cursor = conn.cursor(dictionary=True)
+            try:
+                cursor.execute("SELECT * FROM usuarios WHERE usuario = %s", (username,))
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+
+        if not row:
+            return None
+
+        senha_hash = row.get("senha_hash") or ""
+        if not isinstance(senha_hash, str) or not senha_hash:
+            LOGGER.warning("Usuário '%s' não possui hash de senha cadastrado.", username)
+            return None
+
+        if not bcrypt.checkpw(password.encode("utf-8"), senha_hash.encode("utf-8")):
+            return None
+
+        usuario = Usuario(
+            id=row.get("id", 0),
+            usuario=row.get("usuario", ""),
+            nome=row.get("nome", ""),
+            tipo=row.get("tipo", "usuario"),
+            senha_hash=senha_hash,
+        )
+
+        if registrar_acesso:
+            try:
+                self._produtos_service.registrar_acesso_global(usuario.usuario)
+            except Exception:
+                LOGGER.exception(
+                    "Falha ao registrar acesso global para o usuário '%s'", usuario.usuario
+                )
+
+        return usuario
+
+
+def verificar_login(usuario: str, senha: str) -> Optional[dict]:
+    """Mantido por compatibilidade com código legado."""
+
+    service = AuthService()
+    autenticado = service.authenticate(usuario, senha)
+    return autenticado.to_dict() if autenticado else None
+
+
+def registrar_acesso(usuario: str) -> None:
+    ProdutoService().registrar_acesso_global(usuario)
+
+
+__all__ = ["AuthService", "Usuario", "verificar_login", "registrar_acesso"]
+
+```
+
+## painel_base.py
+
+```python
+"""Componentes base compartilhados entre os painéis de usuário e administrador."""
+
+from __future__ import annotations
+
+from datetime import datetime
+import logging
+from typing import Dict, Sequence
+
+from PySide6 import QtCore, QtWidgets
+
+from services.produtos_service import Produto
+
+
+_STATUS_COLORS = {
+    "Em Desenvolvimento": "#ff5555",
+    "Atualizando": "#ffaa00",
+    "Pronto": "#4ecca3",
+}
+
+
+class PainelCard(QtWidgets.QFrame):
+    """Widget visual responsável por exibir um único produto."""
+
+    activated = QtCore.Signal(Produto)
+
+    def __init__(self, produto: Produto, *, parent: QtWidgets.QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self._produto = produto
+        self._build_ui()
+        self.update_from_produto(produto)
+
+    # ------------------------------------------------------------------
+    # Construção visual
+    # ------------------------------------------------------------------
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        self.lbl_nome = QtWidgets.QLabel()
+        self.lbl_nome.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff;")
+        layout.addWidget(self.lbl_nome)
+
+        self.lbl_status = QtWidgets.QLabel()
+        self.lbl_status.setObjectName("StatusLabel")
+        layout.addWidget(self.lbl_status)
+
+        self.lbl_acesso = QtWidgets.QLabel()
+        layout.addWidget(self.lbl_acesso)
+
+        self.btn_abrir = QtWidgets.QPushButton("Abrir")
+        self.btn_abrir.clicked.connect(self._emit_activated)
+        layout.addWidget(self.btn_abrir)
+
+    # ------------------------------------------------------------------
+    # Atualizações
+    # ------------------------------------------------------------------
+    def update_from_produto(self, produto: Produto) -> None:
+        self._produto = produto
+        self.lbl_nome.setText(produto.nome)
+        status = (produto.status or "Desconhecido").strip()
+        cor = _STATUS_COLORS.get(status, "#888888")
+        self.lbl_status.setText(f"Status: {status}")
+        self.lbl_status.setStyleSheet(f"color: {cor}; font-weight:bold;")
+
+        acesso = BasePainelWindow.formatar_data(produto.ultimo_acesso)
+        self.lbl_acesso.setText(f"Último acesso: {acesso}")
+
+        habilitado = status.lower() == "pronto"
+        self.btn_abrir.setEnabled(habilitado)
+        if habilitado:
+            self.btn_abrir.setStyleSheet(f"background-color:{cor}; color:black; border-radius:6px; padding:6px;")
+        else:
+            self.btn_abrir.setStyleSheet("background-color:#ff5555; color:white; border-radius:6px; padding:6px;")
+
+    # ------------------------------------------------------------------
+    # Eventos
+    # ------------------------------------------------------------------
+    def _emit_activated(self) -> None:
+        if self.btn_abrir.isEnabled():
+            self.activated.emit(self._produto)
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802 (Qt API)
+        self._emit_activated()
+        return super().mouseDoubleClickEvent(event)
+
+    # ------------------------------------------------------------------
+    # Utilidades
+    # ------------------------------------------------------------------
+    @property
+    def produto(self) -> Produto:
+        return self._produto
+
+
+class BasePainelWindow(QtWidgets.QMainWindow):
+    """Janela base que encapsula layout, estilo e utilitários comuns."""
 
     GRID_COLUMNS = 3
-    STYLE_SHEET = """
+    STYLE = """
         QWidget { background-color: #10121B; color: white; font-family: 'Segoe UI'; }
         QLabel#Saudacao {
             font-size: 22px;
@@ -201,18 +585,23 @@ class BasePainelCards(QtWidgets.QMainWindow):
         super().__init__()
         self.user = user
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.cards: Dict[str, PainelCard] = {}
+
         self.setWindowTitle(title)
         self.setGeometry(400, 150, 1100, 650)
-        self.setStyleSheet(self.STYLE_SHEET)
-        self._build_base_ui()
+        self.setStyleSheet(self.STYLE)
+        self._build_base_layout()
 
-    def _build_base_ui(self) -> None:
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
+    def _build_base_layout(self) -> None:
         container = QtWidgets.QWidget()
         layout_root = QtWidgets.QVBoxLayout(container)
 
-        saudacao = QtWidgets.QLabel(f"Olá, {self.user['nome']}!")
+        saudacao = QtWidgets.QLabel(f"Olá, {self.user.get('nome', 'usuário')}!")
         saudacao.setObjectName("Saudacao")
-        saudacao.setAlignment(Qt.AlignCenter)
+        saudacao.setAlignment(QtCore.Qt.AlignCenter)
         layout_root.addWidget(saudacao)
 
         self.grid = QtWidgets.QGridLayout()
@@ -221,459 +610,284 @@ class BasePainelCards(QtWidgets.QMainWindow):
 
         rodape = QtWidgets.QLabel("🟢 Conectado ao sistema_login (MariaDB)")
         rodape.setObjectName("RodapeStatus")
-        rodape.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        rodape.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom)
         layout_root.addWidget(rodape)
 
         self.setCentralWidget(container)
 
-    # ===============================================================
-    # Utilidades de layout
-    # ===============================================================
-    def limpar_grade(self) -> None:
+    # ------------------------------------------------------------------
+    # Cards
+    # ------------------------------------------------------------------
+    def renderizar_produtos(self, produtos: Sequence[Produto]) -> None:
+        self._limpar_grade()
+        self.cards.clear()
+
+        for indice, produto in enumerate(produtos):
+            card = self.criar_card(produto)
+            self.cards[produto.cache_key] = card
+            row, col = divmod(indice, self.GRID_COLUMNS)
+            self.grid.addWidget(card, row, col)
+
+    def criar_card(self, produto: Produto) -> PainelCard:
+        return PainelCard(produto)
+
+    def atualizar_card(self, produto: Produto) -> None:
+        card = self.cards.get(produto.cache_key)
+        if card:
+            card.update_from_produto(produto)
+
+    def _limpar_grade(self) -> None:
         while self.grid.count():
             item = self.grid.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
 
-    def posicionar_card(self, card: QtWidgets.QWidget, indice: int) -> None:
-        row, col = divmod(indice, self.GRID_COLUMNS)
-        self.grid.addWidget(card, row, col)
-
-    def preencher_grade(self, produtos: list, builder: Callable[[dict], QtWidgets.QWidget]) -> None:
-        self.limpar_grade()
-        for indice, produto in enumerate(produtos):
-            self.posicionar_card(builder(produto), indice)
-
-    # ===============================================================
-    # Utilidades gerais
-    # ===============================================================
+    # ------------------------------------------------------------------
+    # Utilidades
+    # ------------------------------------------------------------------
     @staticmethod
     def formatar_data(valor) -> str:
         if not valor:
             return "-"
         try:
-            from datetime import datetime
-
             if isinstance(valor, datetime):
                 return valor.strftime("%d/%m/%Y %H:%M")
-            return datetime.fromisoformat(str(valor).replace("Z", "").split(".")[0]).strftime(
-                "%d/%m/%Y %H:%M"
-            )
-        except Exception:  # pragma: no cover - fallback defensivo
+            return datetime.fromisoformat(str(valor).split(".")[0]).strftime("%d/%m/%Y %H:%M")
+        except Exception:  # pragma: no cover - melhor esforço
             return str(valor)
 
 
+__all__ = ["BasePainelWindow", "PainelCard", "_STATUS_COLORS"]
+
 ```
 
-## `services/produtos_service.py`
+## painel_admin.py
+
 ```python
-"""Funções de acesso e manipulação dos produtos do painel."""
+"""Painel administrativo com atualizações assíncronas e gerenciamento de produtos."""
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterable, List
+from dataclasses import replace
+from typing import Callable, Iterable, List
 
-from database import conectar
+from PySide6 import QtCore, QtWidgets, QtGui
+from PySide6.QtCore import QPoint, QRunnable, QThreadPool
+
+from controle_integracao.controle_integracao import ControleIntegracao
+from manuais_bridge import abrir_manuais_via_qt
+from painel_administracao import PainelAdministracao
+from painel_base import BasePainelWindow, PainelCard
+from services.produtos_service import Produto, ProdutoService
 
 LOGGER = logging.getLogger(__name__)
 
-_PRODUTOS_FIXOS = [
-    "Controle da Integração",
-    "Macro da Regina",
-    "Macro da Folha",
-    "Macro do Fiscal",
-    "Formatador de Balancete",
-    "Manuais",
-]
 
-_SQL_LISTAR = """
-    SELECT id, nome, status, ultimo_acesso
-    FROM produtos
-    WHERE nome IN (
-        'Controle da Integração',
-        'Macro da Regina',
-        'Macro da Folha',
-        'Macro do Fiscal',
-        'Formatador de Balancete',
-        'Manuais'
-    )
-    ORDER BY FIELD(
-        nome,
-        'Controle da Integração',
-        'Macro da Regina',
-        'Macro da Folha',
-        'Macro do Fiscal',
-        'Formatador de Balancete',
-        'Manuais'
-    )
-"""
+class WorkerSignals(QtCore.QObject):
+    finished = QtCore.Signal(list)
+    failed = QtCore.Signal(str)
 
 
-def _buscar_produtos(conn) -> List[Dict]:
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute(_SQL_LISTAR)
-    produtos = cursor.fetchall()
-    cursor.close()
-    return produtos
-
-
-def _inserir_produtos(conn, nomes: Iterable[str]) -> None:
-    valores = [(nome,) for nome in nomes]
-    if not valores:
-        return
-
-    cursor = conn.cursor()
-    cursor.executemany(
-        "INSERT IGNORE INTO produtos (nome, status, ultimo_acesso) VALUES (%s, 'Pronto', NULL)",
-        valores,
-    )
-    conn.commit()
-    cursor.close()
-
-
-def obter_produtos_principais() -> List[Dict]:
-    """Retorna a lista de produtos fixos, garantindo que existam no banco."""
-
-    try:
-        with conectar() as conn:
-            produtos = _buscar_produtos(conn)
-            nomes_banco = {produto["nome"] for produto in produtos}
-            faltando = [nome for nome in _PRODUTOS_FIXOS if nome not in nomes_banco]
-            if faltando:
-                LOGGER.info("Inserindo produtos faltantes: %s", ", ".join(faltando))
-                _inserir_produtos(conn, faltando)
-                produtos = _buscar_produtos(conn)
-            return produtos
-    except Exception:
-        LOGGER.exception("Falha ao obter produtos principais.")
-        raise
-
-
-def registrar_acesso_produto(produto_id: int, usuario: str) -> None:
-    if produto_id is None:
-        raise ValueError("produto_id não pode ser None")
-
-    try:
-        with conectar() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE produtos SET ultimo_acesso = NOW() WHERE id = %s", (produto_id,))
-            cursor.execute(
-                "INSERT INTO acessos (usuario, produto_id) VALUES (%s, %s)",
-                (usuario, produto_id),
-            )
-            conn.commit()
-            cursor.close()
-    except Exception:
-        LOGGER.exception("Não foi possível registrar o acesso ao produto %s", produto_id)
-        raise
-
-
-def atualizar_status_produto(produto_id: int, novo_status: str) -> None:
-    if produto_id is None:
-        raise ValueError("produto_id não pode ser None")
-
-    try:
-        with conectar() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE produtos SET status = %s WHERE id = %s",
-                (novo_status, produto_id),
-            )
-            conn.commit()
-            cursor.close()
-    except Exception:
-        LOGGER.exception(
-            "Falha ao atualizar o status do produto %s para '%s'", produto_id, novo_status
-        )
-        raise
-
-
-def produtos_fixos() -> List[str]:
-    """Retorna a lista de nomes fixos usada nos painéis."""
-
-    return list(_PRODUTOS_FIXOS)
-
-
-```
-
-## `painel_admin.py`
-```python
-import logging
-
-from PySide6 import QtWidgets, QtCore
-from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QPoint
-
-from painel_base import BasePainelCards
-from manuais_bridge import abrir_manuais_via_qt
-from painel_administracao import PainelAdministracao
-from controle_integracao.controle_integracao import ControleIntegracao
-from services.produtos_service import (
-    atualizar_status_produto,
-    obter_produtos_principais,
-    registrar_acesso_produto,
-)
-
-
-# ==========================
-# 1) Worker assíncrono (fetch do DB)
-# ==========================
-class ProdutosFetcherSignals(QObject):
-    done = Signal(list)
-    error = Signal(str)
-
-class ProdutosFetcher(QRunnable):
-    def __init__(self, fetch_fn):
+class ServiceWorker(QRunnable):
+    def __init__(self, fn: Callable[[], Iterable[Produto]]):
         super().__init__()
-        self.fetch_fn = fetch_fn
-        self.signals = ProdutosFetcherSignals()
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self._fn = fn
+        self.signals = WorkerSignals()
 
-    def run(self):
+    def run(self) -> None:  # pragma: no cover - executado em thread de trabalho
         try:
-            produtos = self.fetch_fn()
-            self.signals.done.emit(produtos)
-        except Exception as e:
-            self.logger.exception("Falha ao buscar produtos no worker.")
-            self.signals.error.emit(str(e))
+            resultado = list(self._fn())
+        except Exception as exc:  # pragma: no cover - propagado via sinal
+            LOGGER.exception("Worker de serviço falhou")
+            self.signals.failed.emit(str(exc))
+        else:
+            self.signals.finished.emit(resultado)
 
 
-class PainelAdmin(BasePainelCards):
-    def __init__(self, user):
+class PainelAdmin(BasePainelWindow):
+    """Janela principal utilizada pelos administradores."""
+
+    REFRESH_INTERVAL_MS = 3000
+
+    def __init__(self, user: dict):
         super().__init__(user, "Painel do Administrador")
-        self._card_cache = {}  # {nome: {"frame":..., "lbl_status":..., "lbl_acesso":..., "btn":...}}
+        self._service = ProdutoService()
+        self._pool = QThreadPool.globalInstance()
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(self.REFRESH_INTERVAL_MS)
+        self._timer.timeout.connect(self._schedule_refresh)
 
-        # Pool global para os workers
-        self.pool = QThreadPool.globalInstance()
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self._schedule_refresh)
+        QtWidgets.QShortcut(QtGui.QKeySequence("Esc"), self, self.close)
 
-        # 3) Atalhos
-        QtWidgets.QShortcut(QtCore.QKeySequence("Ctrl+R"), self, self._agendar_refresh_async)
-        QtWidgets.QShortcut(QtCore.QKeySequence("Esc"), self, self.close)
+        self.logger.info("Painel do Administrador inicializado para %s", self.user.get("usuario"))
+        self._janela_admin = None
+        self._janela_integracao = None
+        self._schedule_refresh()
+        self._timer.start()
 
-        self.logger.info("Painel do Administrador inicializado para %s", self.user["usuario"])
-        # Primeira carga (assíncrona)
-        self._agendar_refresh_async(first_build=True)
+    # ------------------------------------------------------------------
+    # Fetch assíncrono
+    # ------------------------------------------------------------------
+    def _schedule_refresh(self) -> None:
+        worker = ServiceWorker(self._fetch_produtos)
+        worker.signals.finished.connect(self._apply_produtos)
+        worker.signals.failed.connect(self._handle_error)
+        self._pool.start(worker)
 
-        # Atualização automática dos cards (assíncrona)
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self._agendar_refresh_async)
-        self.timer.start(3000)
+    def _fetch_produtos(self) -> List[Produto]:
+        return self._service.listar_principais()
 
-    # ===============================================================
-    # 1) Refresh assíncrono
-    # ===============================================================
-    def _agendar_refresh_async(self, first_build: bool = False):
-        self.logger.debug("Agendando refresh dos produtos (first_build=%s)", first_build)
-        worker = ProdutosFetcher(self._buscar_produtos_fixos)
-        worker.signals.done.connect(lambda produtos: self._aplicar_produtos(produtos, first_build))
-        worker.signals.error.connect(self._exibir_erro_fetch)
-        self.pool.start(worker)
+    def _apply_produtos(self, produtos: List[Produto]) -> None:
+        itens = list(produtos)
+        if not any(produto.nome == "Painel de Administração" for produto in itens):
+            itens.append(Produto(id=None, nome="Painel de Administração", status="Pronto", ultimo_acesso=None))
+        self.renderizar_produtos(itens)
 
-    def _exibir_erro_fetch(self, mensagem: str) -> None:
-        self.logger.error("Erro ao atualizar lista de produtos: %s", mensagem)
+    def _handle_error(self, mensagem: str) -> None:
         QtWidgets.QMessageBox.critical(
             self,
             "Erro ao buscar produtos",
             f"Não foi possível carregar os produtos:\n{mensagem}",
         )
 
-    def _aplicar_produtos(self, produtos: list, first_build: bool = False):
-        # Garante o "Painel de Administração"
-        if not any((p.get("nome", "").lower() == "painel de administração") for p in produtos):
-            produtos.append({
-                "id": -1,
-                "nome": "Painel de Administração",
-                "status": "Pronto",
-                "ultimo_acesso": None
-            })
+    # ------------------------------------------------------------------
+    # Criação e atualização dos cards
+    # ------------------------------------------------------------------
+    def criar_card(self, produto: Produto) -> PainelCard:
+        card = super().criar_card(produto)
+        card.activated.connect(self._abrir_modulo)
+        card.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        card.customContextMenuRequested.connect(lambda _pos, c=card: self._abrir_menu(c))
+        if produto.nome == "Painel de Administração":
+            card.btn_abrir.setStyleSheet("background-color:#00aaff; color:black; border-radius:6px; padding:6px;")
+        return card
 
-        if first_build or not self._card_cache:
-            # Limpa grade e monta do zero
-            while self.grid.count():
-                item = self.grid.takeAt(0)
-                w = item.widget()
-                if w:
-                    w.deleteLater()
-            self._card_cache.clear()
+    def atualizar_card(self, produto: Produto) -> None:
+        super().atualizar_card(produto)
+        card = self.cards.get(produto.cache_key)
+        if card and produto.nome == "Painel de Administração":
+            card.btn_abrir.setStyleSheet("background-color:#00aaff; color:black; border-radius:6px; padding:6px;")
 
-            for idx, produto in enumerate(produtos):
-                row, col = divmod(idx, 3)
-                card_info = self._criar_card(produto)
-                self._card_cache[produto["nome"]] = card_info
-                self.grid.addWidget(card_info["frame"], row, col)
+    def _abrir_menu(self, card: PainelCard) -> None:
+        produto = card.produto
+        if produto.id is None:
+            QtWidgets.QMessageBox.information(self, "Informação", "Este card não possui ID no banco de dados.")
             return
 
-        # Atualização incremental
-        for produto in produtos:
-            nome = produto["nome"]
-            if nome in self._card_cache:
-                self._atualizar_card(self._card_cache[nome], produto)
-            else:
-                idx = len(self._card_cache)
-                row, col = divmod(idx, 3)
-                card_info = self._criar_card(produto)
-                self._card_cache[nome] = card_info
-                self.grid.addWidget(card_info["frame"], row, col)
+        menu = QtWidgets.QMenu(card)
+        for status in ("Em Desenvolvimento", "Atualizando", "Pronto"):
+            action = menu.addAction(status)
+            action.triggered.connect(lambda _checked=False, s=status, p=produto: self._alterar_status(p, s))
+        menu.exec(card.mapToGlobal(QPoint(10, 10)))
 
-    # ===============================================================
-    # 4) Buscar produtos (compatível com pool em database.conectar)
-    # ===============================================================
-    def _buscar_produtos_fixos(self):
-        return obter_produtos_principais()
-
-    # ===============================================================
-    # Cards + 2) Menu de contexto
-    # ===============================================================
-    def _criar_card(self, produto):
-        frame = QtWidgets.QFrame()
-        frame.setObjectName("Card")
-        lay = QtWidgets.QVBoxLayout(frame)
-        lay.setSpacing(6)
-
-        lbl_nome = QtWidgets.QLabel(produto["nome"])
-        lbl_nome.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff;")
-        lay.addWidget(lbl_nome)
-
-        status = (produto["status"] or "Desconhecido").strip()
-        cor_status = {"Em Desenvolvimento": "#ff5555", "Atualizando": "#ffaa00", "Pronto": "#4ecca3"}.get(status, "#888")
-        lbl_status = QtWidgets.QLabel(f"Status: {status}")
-        lbl_status.setObjectName("StatusLabel")
-        lbl_status.setStyleSheet(f"color:{cor_status}; font-weight:bold;")
-        lay.addWidget(lbl_status)
-
-        lbl_acesso = QtWidgets.QLabel(
-            f"Último acesso: {self.formatar_data(produto.get('ultimo_acesso'))}"
-        )
-        lay.addWidget(lbl_acesso)
-
-        btn = QtWidgets.QPushButton("Abrir")
-        if status.lower() != "pronto" and produto["nome"].lower() != "painel de administração":
-            btn.setEnabled(False)
-            btn.setStyleSheet("background-color:#ff5555; color:white; border-radius:6px; padding:6px;")
-        else:
-            cor = "#00aaff" if produto["nome"].lower() == "painel de administração" else cor_status
-            btn.setStyleSheet(f"background-color:{cor}; color:black; border-radius:6px; padding:6px;")
-        btn.clicked.connect(lambda _, p=produto: self._abrir_modulo(p))
-        lay.addWidget(btn)
-
-        # Duplo clique abre
-        frame.mouseDoubleClickEvent = lambda ev, p=produto: self._abrir_modulo(p)
-
-        # 2) Menu de contexto
-        frame.setContextMenuPolicy(Qt.CustomContextMenu)
-        frame.customContextMenuRequested.connect(lambda pos, p=produto, f=frame: self._abrir_menu_card(f, p))
-
-        return {"frame": frame, "lbl_status": lbl_status, "lbl_acesso": lbl_acesso, "btn": btn}
-
-    def _abrir_menu_card(self, widget, produto):
-        menu = QtWidgets.QMenu(widget)
-        for novo in ["Em Desenvolvimento", "Atualizando", "Pronto"]:
-            action = menu.addAction(novo)
-            action.triggered.connect(lambda _, n=novo, p=produto: self._atualizar_status_produto(p, n))
-        # abre no canto superior do card (ponto fixo evita problemas de layout)
-        menu.exec(widget.mapToGlobal(QPoint(10, 10)))
-
-    def _atualizar_card(self, card, produto):
-        status = (produto["status"] or "Desconhecido").strip()
-        cor_status = {"Em Desenvolvimento": "#ff5555", "Atualizando": "#ffaa00", "Pronto": "#4ecca3"}.get(status, "#888")
-        card["lbl_status"].setText(f"Status: {status}")
-        card["lbl_status"].setStyleSheet(f"color:{cor_status}; font-weight:bold;")
-        card["lbl_acesso"].setText(
-            f"Último acesso: {self.formatar_data(produto.get('ultimo_acesso'))}"
-        )
-
-        if status.lower() != "pronto" and produto["nome"].lower() != "painel de administração":
-            card["btn"].setEnabled(False)
-            card["btn"].setStyleSheet("background-color:#ff5555; color:white; border-radius:6px; padding:6px;")
-        else:
-            cor = "#00aaff" if produto["nome"].lower() == "painel de administração" else cor_status
-            card["btn"].setEnabled(True)
-            card["btn"].setStyleSheet(f"background-color:{cor}; color:black; border-radius:6px; padding:6px;")
-
-    def _atualizar_status_produto(self, produto, novo_status):
+    def _alterar_status(self, produto: Produto, novo_status: str) -> None:
         try:
-            if produto.get("id", -1) == -1:
-                QtWidgets.QMessageBox.information(self, "Aviso", "Este card é virtual e não possui ID no banco.")
-                return
-            atualizar_status_produto(produto["id"], novo_status)
-            # feedback visual imediato
-            produto["status"] = novo_status
-            card = self._card_cache.get(produto["nome"])
-            if card:
-                self._atualizar_card(card, produto)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Erro", f"Não foi possível atualizar o status:\n{e}")
-            self.logger.exception("Falha ao atualizar status do produto %s", produto.get("id"))
+            if produto.id is not None:
+                self._service.atualizar_status(produto.id, novo_status)
+                atualizado = replace(produto, status=novo_status)
+                self.atualizar_card(atualizado)
+        except Exception as exc:
+            self.logger.exception("Falha ao alterar status do produto %s", produto.id)
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Erro ao atualizar status",
+                f"Não foi possível atualizar o status:\n{exc}",
+            )
 
-    # ===============================================================
-    # Roteamento
-    # ===============================================================
-    def _abrir_modulo(self, produto):
-        nome = produto["nome"]
-        self.logger.info("Ação de abrir módulo: %s", nome)
+    # ------------------------------------------------------------------
+    # Navegação entre módulos
+    # ------------------------------------------------------------------
+    def _abrir_modulo(self, produto: Produto) -> None:
+        nome = produto.nome
+        self.logger.info("Abrindo módulo %s", nome)
 
-        try:
-            if produto.get("id", -1) != -1:
-                registrar_acesso_produto(produto["id"], self.user["usuario"])
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao registrar acesso:\n{e}")
-            self.logger.exception("Falha ao registrar acesso do módulo %s", produto.get("id"))
-            return
+        if produto.id is not None:
+            try:
+                self._service.registrar_acesso(produto.id, self.user.get("usuario", ""))
+            except Exception:
+                self.logger.exception("Falha ao registrar acesso ao produto %s", produto.id)
 
         if nome == "Manuais":
             abrir_manuais_via_qt(self)
         elif nome == "Painel de Administração":
-            self.janela_admin = PainelAdministracao()
-            self.janela_admin.show()
+            self._abrir_painel_administracao()
         elif nome == "Controle da Integração":
-            self.janela_integracao = ControleIntegracao(self.user)
-            self.janela_integracao.show()
+            self._abrir_controle_integracao()
         else:
-            QtWidgets.QMessageBox.information(self, "Ainda não implementado",
-                                              f"O módulo '{nome}' ainda não foi conectado.")
+            QtWidgets.QMessageBox.information(
+                self,
+                "Módulo não disponível",
+                f"O módulo '{nome}' ainda não foi conectado.",
+            )
 
-    # ===============================================================
-    # 1) Bônus: pausa o timer quando perde foco (economiza recursos)
-    # ===============================================================
-    def event(self, e):
-        if e.type() == QtCore.QEvent.WindowActivate:
-            if not self.timer.isActive():
-                self.timer.start(3000)
-        elif e.type() == QtCore.QEvent.WindowDeactivate:
-            if self.timer.isActive():
-                self.timer.stop()
-        return super().event(e)
+    def _abrir_painel_administracao(self) -> None:
+        janela = PainelAdministracao()
+        janela.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        janela.show()
+        self._janela_admin = janela
+
+    def _abrir_controle_integracao(self) -> None:
+        janela = ControleIntegracao(self.user)
+        janela.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        janela.show()
+        self._janela_integracao = janela
+
+    # ------------------------------------------------------------------
+    # Otimizações
+    # ------------------------------------------------------------------
+    def event(self, event):  # noqa: D401 - assinatura Qt
+        if event.type() == QtCore.QEvent.WindowActivate and not self._timer.isActive():
+            self._timer.start(self.REFRESH_INTERVAL_MS)
+        elif event.type() == QtCore.QEvent.WindowDeactivate and self._timer.isActive():
+            self._timer.stop()
+        return super().event(event)
+
+
+__all__ = ["PainelAdmin"]
 
 ```
 
-## `painel_user.py`
+## painel_user.py
+
 ```python
-from PySide6 import QtWidgets, QtCore
+"""Painel destinado aos usuários finais com consulta periódica dos produtos."""
 
-from painel_base import BasePainelCards
+from __future__ import annotations
+
+from PySide6 import QtCore, QtWidgets
+
+from controle_integracao.controle_integracao import ControleIntegracao
 from manuais_bridge import abrir_manuais_via_qt
-from controle_integracao.controle_integracao import ControleIntegracao  # 🔗 integração total
-from services.produtos_service import obter_produtos_principais, registrar_acesso_produto
+from painel_base import BasePainelWindow, PainelCard
+from services.produtos_service import Produto, ProdutoService
 
 
-class PainelUser(BasePainelCards):
-    def __init__(self, user):
+class PainelUser(BasePainelWindow):
+    REFRESH_INTERVAL_MS = 3000
+
+    def __init__(self, user: dict):
         super().__init__(user, "Painel do Usuário")
-        self.logger.info("Painel do Usuário inicializado para %s", self.user["usuario"])
-        self._preencher_cards()
+        self._service = ProdutoService()
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(self.REFRESH_INTERVAL_MS)
+        self._timer.timeout.connect(self._refresh_produtos)
 
-        # Atualização automática dos cards
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self._preencher_cards)
-        self.timer.start(3000)
+        self.logger.info("Painel do Usuário inicializado para %s", self.user.get("usuario"))
+        self._janela_integracao = None
+        self._refresh_produtos()
+        self._timer.start()
 
-    # ===============================================================
-    # Atualiza os cards
-    # ===============================================================
-    def _preencher_cards(self):
+    def criar_card(self, produto: Produto) -> PainelCard:
+        card = super().criar_card(produto)
+        card.activated.connect(self._abrir_modulo)
+        return card
+
+    def _refresh_produtos(self) -> None:
         try:
-            produtos = obter_produtos_principais()
+            produtos = self._service.listar_principais()
         except Exception as exc:
             self.logger.exception("Falha ao carregar produtos no painel do usuário.")
             QtWidgets.QMessageBox.critical(
@@ -681,141 +895,250 @@ class PainelUser(BasePainelCards):
                 "Erro ao buscar produtos",
                 f"Não foi possível carregar os produtos:\n{exc}",
             )
-            produtos = []
-
-        self.preencher_grade(produtos, self._criar_card)
-
-    # ===============================================================
-    # Criação dos cards
-    # ===============================================================
-    def _criar_card(self, produto):
-        frame = QtWidgets.QFrame()
-        frame.setObjectName("Card")
-        lay = QtWidgets.QVBoxLayout(frame)
-        lay.setSpacing(6)
-
-        # Nome
-        lbl_nome = QtWidgets.QLabel(produto["nome"])
-        lbl_nome.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff;")
-        lay.addWidget(lbl_nome)
-
-        # Status
-        status_texto = produto["status"] or "Desconhecido"
-        cor_status = {
-            "Em Desenvolvimento": "#ff5555",
-            "Atualizando": "#ffaa00",
-            "Pronto": "#4ecca3",
-        }.get(status_texto, "#888888")
-
-        lbl_status = QtWidgets.QLabel(f"Status: {status_texto}")
-        lbl_status.setObjectName("StatusLabel")
-        lbl_status.setStyleSheet(f"color: {cor_status}; font-weight:bold;")
-        lay.addWidget(lbl_status)
-
-        # Último acesso
-        lbl_acesso = QtWidgets.QLabel(
-            f"Último acesso: {self.formatar_data(produto.get('ultimo_acesso'))}"
-        )
-        lay.addWidget(lbl_acesso)
-
-        # Botão
-        btn_abrir = QtWidgets.QPushButton("Abrir")
-        status_norm = status_texto.strip().lower()
-
-        if status_norm != "pronto":
-            btn_abrir.setEnabled(False)
-            btn_abrir.setStyleSheet("background-color:#ff5555; color:white; border-radius:6px; padding:6px;")
-        else:
-            btn_abrir.setStyleSheet(f"background-color:{cor_status}; color:black; border-radius:6px; padding:6px;")
-
-        btn_abrir.clicked.connect(lambda _, p=produto: self._abrir_modulo(p))
-        lay.addWidget(btn_abrir)
-        return frame
-
-    # ===============================================================
-    # Roteamento dos módulos
-    # ===============================================================
-    def _abrir_modulo(self, produto):
-        nome_modulo = produto["nome"]
-        status_modulo = (produto["status"] or "").strip().lower()
-        self.logger.info("Usuário solicitou módulo '%s' (status=%s)", nome_modulo, status_modulo)
-
-        # Log de acesso
-        try:
-            registrar_acesso_produto(produto["id"], self.user["usuario"])
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao registrar acesso:\n{e}")
-            self.logger.exception(
-                "Falha ao registrar acesso do usuário %s ao produto %s",
-                self.user["usuario"],
-                produto.get("id"),
-            )
             return
 
-        # Abre os módulos
-        if nome_modulo == "Manuais":
+        self.renderizar_produtos(produtos)
+
+    def _abrir_modulo(self, produto: Produto) -> None:
+        nome = produto.nome
+        self.logger.info("Usuário acionou módulo %s", nome)
+
+        if produto.id is not None:
+            try:
+                self._service.registrar_acesso(produto.id, self.user.get("usuario", ""))
+            except Exception:
+                self.logger.exception(
+                    "Falha ao registrar acesso do usuário %s ao produto %s",
+                    self.user.get("usuario"),
+                    produto.id,
+                )
+                return
+
+        if nome == "Manuais":
             abrir_manuais_via_qt(self)
-            return
+        elif nome == "Controle da Integração":
+            janela = ControleIntegracao(self.user)
+            janela.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+            janela.show()
+            self._janela_integracao = janela
+        else:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Módulo não disponível",
+                f"O módulo '{nome}' ainda não foi conectado.",
+            )
 
-        if nome_modulo == "Controle da Integração":
-            self.janela_integracao = ControleIntegracao(self.user)
-            self.janela_integracao.show()
-            return
 
-        QtWidgets.QMessageBox.information(
-            self, "Ainda não implementado",
-            f"O módulo '{nome_modulo}' ainda não foi conectado."
-        )
+__all__ = ["PainelUser"]
 
 ```
 
-## `utils.py`
+## main.py
+
 ```python
-import logging
+"""Ponto de entrada da aplicação PySide6 responsável pelo fluxo de login."""
 
-import bcrypt
+from __future__ import annotations
 
-from database import conectar
+import os
+from typing import Optional
 
-LOGGER = logging.getLogger(__name__)
+from PySide6 import QtCore, QtGui, QtWidgets
 
-def verificar_login(usuario, senha):
-    try:
-        with conectar() as conn:
-            cursor = conn.cursor(dictionary=True)
-            try:
-                cursor.execute("SELECT * FROM usuarios WHERE usuario = %s", (usuario,))
-                user = cursor.fetchone()
-            finally:
-                cursor.close()
+from painel_admin import PainelAdmin
+from painel_user import PainelUser
+from utils import AuthService, Usuario
 
-        if user and bcrypt.checkpw(senha.encode("utf-8"), user["senha_hash"].encode("utf-8")):
-            registrar_acesso(user["usuario"])
-            return user
-    except Exception:
-        LOGGER.exception("Erro ao verificar login do usuário '%s'", usuario)
-        raise
+os.environ.setdefault("QT_OPENGL", "software")
 
-    return None
 
-def registrar_acesso(usuario):
-    """Atualiza o último acesso de todos os produtos e registra o log."""
+class LoginWindow(QtWidgets.QMainWindow):
+    """Janela de autenticação que direciona o usuário para o painel adequado."""
 
-    try:
-        with conectar() as conn:
-            cursor = conn.cursor()
-            try:
-                cursor.execute("UPDATE produtos SET ultimo_acesso = NOW()")
-                cursor.execute(
-                    "INSERT INTO acessos (usuario, produto_id) SELECT %s, id FROM produtos",
-                    (usuario,),
-                )
-                conn.commit()
-            finally:
-                cursor.close()
-    except Exception:
-        LOGGER.exception("Erro ao registrar acesso em massa do usuário '%s'", usuario)
-        raise
+    def __init__(self, auth_service: Optional[AuthService] = None):
+        super().__init__()
+        self.auth_service = auth_service or AuthService()
+        self._painel_atual: Optional[QtWidgets.QWidget] = None
+
+        self.setWindowTitle("Login - Sistema de Painéis")
+        self.setFixedSize(420, 320)
+        self.setWindowIcon(QtGui.QIcon())
+        self._configurar_estilos()
+        self._construir_interface()
+
+    # ------------------------------------------------------------------
+    # Construção da interface
+    # ------------------------------------------------------------------
+    def _configurar_estilos(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget { background-color: #10121B; color: white; font-family: 'Segoe UI'; }
+            QLabel#Titulo { font-size: 22px; font-weight: bold; color: #4ecca3; }
+            QLineEdit {
+                background-color: #1b1e2b;
+                border: 1px solid #3a3f58;
+                border-radius: 6px;
+                padding: 8px;
+                color: white;
+            }
+            QPushButton {
+                background-color: #4ecca3;
+                color: black;
+                font-weight: bold;
+                border-radius: 6px;
+                padding: 8px;
+            }
+            QPushButton:hover { background-color: #6eecc1; }
+            QToolButton {
+                border: none;
+                background: transparent;
+            }
+            """
+        )
+
+    def _construir_interface(self) -> None:
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setAlignment(QtCore.Qt.AlignCenter)
+
+        titulo = QtWidgets.QLabel("Acesso ao Sistema")
+        titulo.setObjectName("Titulo")
+        titulo.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(titulo)
+        layout.addSpacing(20)
+
+        self.input_usuario = QtWidgets.QLineEdit()
+        self.input_usuario.setPlaceholderText("Usuário")
+        layout.addWidget(self.input_usuario)
+
+        senha_layout = QtWidgets.QHBoxLayout()
+        self.input_senha = QtWidgets.QLineEdit()
+        self.input_senha.setPlaceholderText("Senha")
+        self.input_senha.setEchoMode(QtWidgets.QLineEdit.Password)
+        senha_layout.addWidget(self.input_senha)
+
+        self.btn_toggle_senha = QtWidgets.QToolButton()
+        self.btn_toggle_senha.setIcon(self._icone_senha())
+        self.btn_toggle_senha.setCheckable(True)
+        self.btn_toggle_senha.setToolTip("Mostrar/Ocultar senha")
+        self.btn_toggle_senha.clicked.connect(self._alternar_senha)
+        senha_layout.addWidget(self.btn_toggle_senha)
+        layout.addLayout(senha_layout)
+
+        layout.addSpacing(20)
+
+        self.btn_login = QtWidgets.QPushButton("Entrar")
+        self.btn_login.clicked.connect(self._executar_login)
+        layout.addWidget(self.btn_login)
+
+        self.setCentralWidget(container)
+
+        self.input_usuario.returnPressed.connect(self._executar_login)
+        self.input_senha.returnPressed.connect(self._executar_login)
+        self.input_usuario.setFocus()
+
+    # ------------------------------------------------------------------
+    # Eventos de UI
+    # ------------------------------------------------------------------
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: D401 - assinatura Qt
+        if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            self._executar_login()
+        else:
+            super().keyPressEvent(event)
+
+    def _alternar_senha(self) -> None:
+        if self.input_senha.echoMode() == QtWidgets.QLineEdit.Password:
+            self.input_senha.setEchoMode(QtWidgets.QLineEdit.Normal)
+        else:
+            self.input_senha.setEchoMode(QtWidgets.QLineEdit.Password)
+
+    def _icone_senha(self) -> QtGui.QIcon:
+        pixmap = QtGui.QPixmap(16, 16)
+        pixmap.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(pixmap)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#4ecca3"), 2))
+        painter.drawEllipse(2, 4, 12, 8)
+        painter.end()
+        return QtGui.QIcon(pixmap)
+
+    # ------------------------------------------------------------------
+    # Lógica de autenticação
+    # ------------------------------------------------------------------
+    def _executar_login(self) -> None:
+        usuario = self.input_usuario.text().strip()
+        senha = self.input_senha.text().strip()
+
+        if not usuario or not senha:
+            QtWidgets.QMessageBox.warning(self, "Aviso", "Preencha todos os campos.")
+            return
+
+        try:
+            autenticado = self.auth_service.authenticate(usuario, senha)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Dados inválidos", str(exc))
+            return
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao validar login:\n{exc}")
+            return
+
+        if not autenticado:
+            QtWidgets.QMessageBox.warning(self, "Erro", "Usuário ou senha inválidos.")
+            return
+
+        QtWidgets.QMessageBox.information(self, "Sucesso", f"Bem-vindo, {autenticado.nome}!")
+        self._abrir_painel(autenticado)
+
+    def _abrir_painel(self, usuario: Usuario) -> None:
+        if self._painel_atual is not None:
+            self._painel_atual.close()
+
+        painel: QtWidgets.QWidget
+        if usuario.tipo.lower() == "admin":
+            painel = PainelAdmin(usuario.to_dict())
+        else:
+            painel = PainelUser(usuario.to_dict())
+
+        painel.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        painel.show()
+        painel.closeEvent = self._retornar_para_login  # type: ignore[assignment]
+
+        self._painel_atual = painel
+        self.hide()
+
+    def _retornar_para_login(self, event: QtGui.QCloseEvent) -> None:
+        self._painel_atual = None
+        self.show()
+        event.accept()
+
+
+def run() -> None:
+    app = QtWidgets.QApplication([])
+    app.setWindowIcon(QtGui.QIcon())
+
+    janela = LoginWindow()
+    janela.show()
+
+    app.exec()
+
+
+if __name__ == "__main__":
+    run()
+
+```
+
+## login.py
+
+```python
+"""Ponto de acesso alternativo para iniciar a aplicação de login."""
+
+from __future__ import annotations
+
+from main import run
+
+
+if __name__ == "__main__":
+    run()
 
 ```
 

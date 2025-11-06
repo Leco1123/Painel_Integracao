@@ -1,156 +1,171 @@
-# database.py
+"""Infraestrutura de acesso ao banco de dados MySQL utilizada pelos painéis."""
+
+from __future__ import annotations
+
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, Optional
 
 from mysql.connector import Error, pooling
 
 LOGGER = logging.getLogger(__name__)
 
-
-def _load_dotenv() -> None:
-    """Carrega um arquivo .env localizado ao lado do projeto, se existir."""
-    env_path = Path(__file__).resolve().parent / ".env"
-    if not env_path.exists():
-        return
-
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip())
+_ENV_FILE_CANDIDATES: Iterable[Path] = (
+    Path(__file__).resolve().parent / ".env",
+    Path(__file__).resolve().parent.parent / ".env",
+)
 
 
-def _build_db_config() -> Dict[str, object]:
-    _load_dotenv()
+@dataclass(frozen=True)
+class DatabaseSettings:
+    """Representa a configuração necessária para montar o pool de conexões."""
 
-    defaults = {
-        "DB_HOST": "localhost",
-        "DB_USER": "root",
-        "DB_PASS": "int123!",
-        "DB_NAME": "sistema_login",
-        "DB_PORT": "3306",
-    }
+    host: str = "localhost"
+    port: int = 3306
+    user: str = "root"
+    password: str = "int123!"
+    database: str = "sistema_login"
 
-    missing_values = []
-    raw_config: Dict[str, str] = {}
-    for key, default in defaults.items():
-        value = os.environ.get(key)
-        if not value:
-            missing_values.append(key)
-            value = default
-        raw_config[key] = value
+    @classmethod
+    def load(cls) -> "DatabaseSettings":
+        """Carrega as configurações a partir do ambiente e de arquivos ``.env``."""
 
-    if missing_values:
-        LOGGER.warning(
-            "Variáveis de ambiente ausentes ou vazias (%s); usando valores padrão.",
-            ", ".join(sorted(missing_values)),
+        env_file_values = _load_env_files()
+        for key, value in env_file_values.items():
+            os.environ.setdefault(key, value)
+
+        merged: Dict[str, Optional[str]] = {
+            "DB_HOST": cls.host,
+            "DB_USER": cls.user,
+            "DB_PASS": cls.password,
+            "DB_NAME": cls.database,
+            "DB_PORT": str(cls.port),
+        }
+        for key in merged.keys():
+            value = os.environ.get(key)
+            if value:
+                merged[key] = value
+
+        missing = [key for key in ("DB_HOST", "DB_USER", "DB_PASS", "DB_NAME") if not merged.get(key)]
+        if missing:
+            LOGGER.warning(
+                "Variáveis de ambiente não fornecidas: %s. Utilizando valores padrão.",
+                ", ".join(missing),
+            )
+
+        try:
+            port = int(merged["DB_PORT"])
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "Valor inválido para DB_PORT (%s); utilizando %s.",
+                merged.get("DB_PORT"),
+                cls.port,
+            )
+            port = cls.port
+
+        return cls(
+            host=str(merged["DB_HOST"]),
+            user=str(merged["DB_USER"]),
+            password=str(merged["DB_PASS"]),
+            database=str(merged["DB_NAME"]),
+            port=port,
         )
 
-    try:
-        port = int(raw_config["DB_PORT"] or defaults["DB_PORT"])
-    except (TypeError, ValueError):
-        LOGGER.warning(
-            "Valor inválido para DB_PORT (%s); usando %s.",
-            raw_config["DB_PORT"],
-            defaults["DB_PORT"],
-        )
-        port = int(defaults["DB_PORT"])
-
-    config: Dict[str, object] = {
-        "host": raw_config["DB_HOST"],
-        "user": raw_config["DB_USER"],
-        "password": raw_config["DB_PASS"],
-        "database": raw_config["DB_NAME"],
-        "port": port,
-    }
-    return config
+    def to_mysql_kwargs(self) -> Dict[str, object]:
+        return {
+            "host": self.host,
+            "user": self.user,
+            "password": self.password,
+            "database": self.database,
+            "port": self.port,
+        }
 
 
-DB_CONFIG = _build_db_config()
+def _load_env_files() -> Dict[str, str]:
+    """Retorna um dicionário com valores extraídos de eventuais arquivos ``.env``."""
+
+    data: Dict[str, str] = {}
+    for path in _ENV_FILE_CANDIDATES:
+        if not path or not path.exists():
+            continue
+        try:
+            for raw_line in path.read_text().splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                data.setdefault(key.strip(), value.strip())
+        except OSError as exc:
+            LOGGER.debug("Não foi possível ler %s: %s", path, exc)
+    return data
 
 
-# -----------------------------------------
-# Pool
-# -----------------------------------------
-try:
-    _POOL = pooling.MySQLConnectionPool(
-        pool_name="painel_pool",
-        pool_size=5,
-        pool_reset_session=True,
-        **DB_CONFIG,
-    )
-    LOGGER.info("Pool de conexões iniciado com sucesso.")
-except Error as exc:
-    LOGGER.exception("Falha ao criar pool de conexões.")
-    _POOL = None
+class _ConnectionHandle:
+    """Proxy amigável que funciona tanto com ``with`` quanto em uso direto."""
 
-
-# -----------------------------------------
-# Proxy que funciona com e sem 'with'
-# -----------------------------------------
-class _ConnectionProxy:
-    """
-    - Suporta uso com 'with conectar() as conn'
-    - Suporta uso direto: conn = conectar(); conn.cursor()
-    - Encaminha atributos para a conexão real (lazy)
-    """
-    def __init__(self, pool):
+    def __init__(self, pool: Optional[pooling.MySQLConnectionPool]):
         self._pool = pool
         self._conn = None
 
-    def _ensure(self):
+    def _ensure_connection(self):
         if self._conn is None:
             if not self._pool:
                 raise RuntimeError("Pool de conexões não inicializado.")
             self._conn = self._pool.get_connection()
-
-    # Context manager
-    def __enter__(self):
-        self._ensure()
         return self._conn
 
+    # API compatível com ``with conectar() as conn``
+    def __enter__(self):
+        return self._ensure_connection()
+
     def __exit__(self, exc_type, exc, tb):
-        try:
-            if self._conn and self._conn.is_connected():
-                self._conn.close()  # devolve ao pool
-        finally:
-            self._conn = None
+        self.close()
+        return False
 
-    # Encaminha qualquer atributo/método para a conexão real
-    def __getattr__(self, name):
-        self._ensure()
-        return getattr(self._conn, name)
+    # Encaminhamento para o objeto real
+    def __getattr__(self, item):
+        connection = self._ensure_connection()
+        return getattr(connection, item)
 
-    # Para casos como: if conn: ...
     def __bool__(self):
-        self._ensure()
-        return bool(self._conn)
+        return self._conn is not None
+
+    def close(self):
+        if self._conn is not None:
+            try:
+                if self._conn.is_connected():
+                    self._conn.close()
+            finally:
+                self._conn = None
 
 
-# -----------------------------------------
-# API pública
-# -----------------------------------------
-def conectar():
-    """
-    Retorna um proxy de conexão.
-    Pode ser usado de duas formas:
+SETTINGS = DatabaseSettings.load()
 
-        # 1) Context manager (recomendado)
-        with conectar() as conn:
-            cur = conn.cursor(dictionary=True)
-            cur.execute("SELECT 1")
-            conn.commit()
+try:
+    _POOL: Optional[pooling.MySQLConnectionPool] = pooling.MySQLConnectionPool(
+        pool_name="painel_pool",
+        pool_reset_session=True,
+        pool_size=5,
+        **SETTINGS.to_mysql_kwargs(),
+    )
+    LOGGER.info(
+        "Pool de conexões criado: %s@%s:%s/%s",
+        SETTINGS.user,
+        SETTINGS.host,
+        SETTINGS.port,
+        SETTINGS.database,
+    )
+except Error:
+    LOGGER.exception("Falha ao inicializar o pool de conexões com o MySQL.")
+    _POOL = None
 
-        # 2) Direto (compatibilidade)
-        conn = conectar()
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        conn.commit()
-        conn.close()
-    """
-    return _ConnectionProxy(_POOL)
+
+def conectar() -> _ConnectionHandle:
+    """Retorna um proxy de conexão reutilizável."""
+
+    return _ConnectionHandle(_POOL)
+
+
+__all__ = ["SETTINGS", "conectar", "DatabaseSettings"]
