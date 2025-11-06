@@ -1,5 +1,5 @@
-"""Pacote de serviços do domínio utilizado pelos painéis."""
+"""Pacote que reúne serviços de domínio utilizados pela aplicação."""
 
-from .produtos_service import Produto, ProdutoService
+from .produtos_service import Produto, ProdutoRepository, ProdutoService, ProdutoStatus
 
-__all__ = ["Produto", "ProdutoService"]
+__all__ = ["Produto", "ProdutoRepository", "ProdutoService", "ProdutoStatus"]

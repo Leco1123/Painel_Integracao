@@ -1,4 +1,4 @@
-"""Painel destinado aos usuários finais com consulta periódica dos produtos."""
+"""Painel destinado aos usuários finais do sistema."""
 
 from __future__ import annotations
 
@@ -6,35 +6,36 @@ from PySide6 import QtCore, QtWidgets
 
 from controle_integracao.controle_integracao import ControleIntegracao
 from manuais_bridge import abrir_manuais_via_qt
-from painel_base import BasePainelWindow, PainelCard
+from painel_base import BasePainelWindow, ProductCard
 from services.produtos_service import Produto, ProdutoService
 
 
 class PainelUser(BasePainelWindow):
-    REFRESH_INTERVAL_MS = 3000
+    REFRESH_INTERVAL_MS = 4000
 
-    def __init__(self, user: dict):
-        super().__init__(user, "Painel do Usuário")
+    def __init__(self, usuario: dict):
+        super().__init__(usuario, "Painel do Usuário")
         self._service = ProdutoService()
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(self.REFRESH_INTERVAL_MS)
-        self._timer.timeout.connect(self._refresh_produtos)
+        self._timer.timeout.connect(self._atualizar_produtos)
 
-        self.logger.info("Painel do Usuário inicializado para %s", self.user.get("usuario"))
+        self.logger.info("Painel do usuário inicializado para %s", self.usuario.get("usuario"))
         self._janela_integracao = None
-        self._refresh_produtos()
+        self._atualizar_produtos()
         self._timer.start()
 
-    def criar_card(self, produto: Produto) -> PainelCard:
+    def criar_card(self, produto: Produto) -> ProductCard:
         card = super().criar_card(produto)
         card.activated.connect(self._abrir_modulo)
         return card
 
-    def _refresh_produtos(self) -> None:
+    def _atualizar_produtos(self) -> None:
         try:
             produtos = self._service.listar_principais()
         except Exception as exc:
             self.logger.exception("Falha ao carregar produtos no painel do usuário.")
+            self.atualizar_rodape("🔴 Falha ao buscar produtos")
             QtWidgets.QMessageBox.critical(
                 self,
                 "Erro ao buscar produtos",
@@ -43,26 +44,28 @@ class PainelUser(BasePainelWindow):
             return
 
         self.renderizar_produtos(produtos)
+        self.atualizar_rodape("🟢 Conectado ao banco de dados")
+
+    def _registrar_acesso(self, produto: Produto) -> None:
+        if produto.id is None:
+            return
+        try:
+            self._service.registrar_acesso(produto.id, self.usuario.get("usuario", ""))
+        except Exception:
+            self.logger.exception(
+                "Falha ao registrar acesso do usuário %s ao produto %s",
+                self.usuario.get("usuario"),
+                produto.id,
+            )
 
     def _abrir_modulo(self, produto: Produto) -> None:
-        nome = produto.nome
-        self.logger.info("Usuário acionou módulo %s", nome)
+        self.logger.info("Usuário acionou módulo %s", produto.nome)
+        self._registrar_acesso(produto)
 
-        if produto.id is not None:
-            try:
-                self._service.registrar_acesso(produto.id, self.user.get("usuario", ""))
-            except Exception:
-                self.logger.exception(
-                    "Falha ao registrar acesso do usuário %s ao produto %s",
-                    self.user.get("usuario"),
-                    produto.id,
-                )
-                return
-
-        if nome == "Manuais":
+        if produto.nome == "Manuais":
             abrir_manuais_via_qt(self)
-        elif nome == "Controle da Integração":
-            janela = ControleIntegracao(self.user)
+        elif produto.nome == "Controle da Integração":
+            janela = ControleIntegracao(self.usuario)
             janela.setAttribute(QtCore.Qt.WA_DeleteOnClose)
             janela.show()
             self._janela_integracao = janela
@@ -70,7 +73,7 @@ class PainelUser(BasePainelWindow):
             QtWidgets.QMessageBox.information(
                 self,
                 "Módulo não disponível",
-                f"O módulo '{nome}' ainda não foi conectado.",
+                f"O módulo '{produto.nome}' ainda não foi conectado.",
             )
 
 

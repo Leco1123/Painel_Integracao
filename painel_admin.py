@@ -1,127 +1,126 @@
-"""Painel administrativo com atualizações assíncronas e gerenciamento de produtos."""
+"""Painel administrativo responsável por orquestrar os módulos internos."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
-from typing import Callable, Iterable, List
+from typing import Callable, List
 
-from PySide6 import QtCore, QtWidgets, QtGui
-from PySide6.QtCore import QPoint, QRunnable, QThreadPool
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from controle_integracao.controle_integracao import ControleIntegracao
 from manuais_bridge import abrir_manuais_via_qt
 from painel_administracao import PainelAdministracao
-from painel_base import BasePainelWindow, PainelCard
-from services.produtos_service import Produto, ProdutoService
+from painel_base import BasePainelWindow, ProductCard
+from services.produtos_service import Produto, ProdutoService, ProdutoStatus
 
 LOGGER = logging.getLogger(__name__)
 
 
-class WorkerSignals(QtCore.QObject):
-    finished = QtCore.Signal(list)
-    failed = QtCore.Signal(str)
+class _WorkerSignals(QtCore.QObject):
+    succeeded = QtCore.Signal(list)
+    failed = QtCore.Signal(object)
 
 
-class ServiceWorker(QRunnable):
-    def __init__(self, fn: Callable[[], Iterable[Produto]]):
+class _Worker(QtCore.QRunnable):
+    def __init__(self, task: Callable[[], List[Produto]]):
         super().__init__()
-        self._fn = fn
-        self.signals = WorkerSignals()
+        self._task = task
+        self.signals = _WorkerSignals()
 
-    def run(self) -> None:  # pragma: no cover - executado em thread de trabalho
+    def run(self) -> None:  # pragma: no cover - executado fora da thread principal
         try:
-            resultado = list(self._fn())
-        except Exception as exc:  # pragma: no cover - propagado via sinal
-            LOGGER.exception("Worker de serviço falhou")
-            self.signals.failed.emit(str(exc))
+            resultado = list(self._task())
+        except Exception as exc:  # pragma: no cover - repassado ao Qt
+            LOGGER.exception("Worker de produtos falhou")
+            self.signals.failed.emit(exc)
         else:
-            self.signals.finished.emit(resultado)
+            self.signals.succeeded.emit(resultado)
 
 
 class PainelAdmin(BasePainelWindow):
-    """Janela principal utilizada pelos administradores."""
+    REFRESH_INTERVAL_MS = 3500
 
-    REFRESH_INTERVAL_MS = 3000
-
-    def __init__(self, user: dict):
-        super().__init__(user, "Painel do Administrador")
+    def __init__(self, usuario: dict):
+        super().__init__(usuario, "Painel do Administrador")
         self._service = ProdutoService()
-        self._pool = QThreadPool.globalInstance()
+        self._thread_pool = QtCore.QThreadPool.globalInstance()
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(self.REFRESH_INTERVAL_MS)
         self._timer.timeout.connect(self._schedule_refresh)
+        self._refreshing = False
 
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self._schedule_refresh)
         QtWidgets.QShortcut(QtGui.QKeySequence("Esc"), self, self.close)
 
-        self.logger.info("Painel do Administrador inicializado para %s", self.user.get("usuario"))
+        self.logger.info("Painel administrativo inicializado para %s", self.usuario.get("usuario"))
         self._janela_admin = None
         self._janela_integracao = None
+
         self._schedule_refresh()
         self._timer.start()
 
     # ------------------------------------------------------------------
-    # Fetch assíncrono
+    # Atualização dos produtos
     # ------------------------------------------------------------------
     def _schedule_refresh(self) -> None:
-        worker = ServiceWorker(self._fetch_produtos)
-        worker.signals.finished.connect(self._apply_produtos)
-        worker.signals.failed.connect(self._handle_error)
-        self._pool.start(worker)
+        if self._refreshing:
+            return
+        worker = _Worker(self._service.listar_principais)
+        worker.signals.succeeded.connect(self._on_refresh_success)
+        worker.signals.failed.connect(self._on_refresh_error)
+        self.atualizar_rodape("🔄 Atualizando lista de produtos...")
+        self._refreshing = True
+        self._thread_pool.start(worker)
 
-    def _fetch_produtos(self) -> List[Produto]:
-        return self._service.listar_principais()
+    @QtCore.Slot(list)
+    def _on_refresh_success(self, produtos: List[Produto]) -> None:
+        lista = list(produtos)
+        if not any(prod.nome == "Painel de Administração" for prod in lista):
+            lista.append(Produto(id=None, nome="Painel de Administração", status=ProdutoStatus.PRONTO.value, ultimo_acesso=None))
+        self.renderizar_produtos(lista)
+        self.atualizar_rodape("🟢 Conectado ao banco de dados")
+        self._refreshing = False
 
-    def _apply_produtos(self, produtos: List[Produto]) -> None:
-        itens = list(produtos)
-        if not any(produto.nome == "Painel de Administração" for produto in itens):
-            itens.append(Produto(id=None, nome="Painel de Administração", status="Pronto", ultimo_acesso=None))
-        self.renderizar_produtos(itens)
-
-    def _handle_error(self, mensagem: str) -> None:
+    @QtCore.Slot(object)
+    def _on_refresh_error(self, erro: Exception) -> None:
+        self.logger.exception("Erro ao atualizar produtos", exc_info=erro)
+        self.atualizar_rodape("🔴 Falha ao consultar produtos")
         QtWidgets.QMessageBox.critical(
             self,
             "Erro ao buscar produtos",
-            f"Não foi possível carregar os produtos:\n{mensagem}",
+            f"Não foi possível carregar os produtos:\n{erro}",
         )
+        self._refreshing = False
 
     # ------------------------------------------------------------------
-    # Criação e atualização dos cards
+    # Personalização dos cards
     # ------------------------------------------------------------------
-    def criar_card(self, produto: Produto) -> PainelCard:
+    def criar_card(self, produto: Produto) -> ProductCard:
         card = super().criar_card(produto)
         card.activated.connect(self._abrir_modulo)
         card.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
-        card.customContextMenuRequested.connect(lambda _pos, c=card: self._abrir_menu(c))
+        card.customContextMenuRequested.connect(lambda pos, c=card: self._mostrar_menu_status(c, pos))
         if produto.nome == "Painel de Administração":
-            card.btn_abrir.setStyleSheet("background-color:#00aaff; color:black; border-radius:6px; padding:6px;")
+            card.btn_abrir.setStyleSheet("background-color: #38bdf8; color: black; font-weight: bold; border-radius: 6px; padding: 8px;")
         return card
 
-    def atualizar_card(self, produto: Produto) -> None:
-        super().atualizar_card(produto)
-        card = self.cards.get(produto.cache_key)
-        if card and produto.nome == "Painel de Administração":
-            card.btn_abrir.setStyleSheet("background-color:#00aaff; color:black; border-radius:6px; padding:6px;")
-
-    def _abrir_menu(self, card: PainelCard) -> None:
+    # ------------------------------------------------------------------
+    # Manipulação de status
+    # ------------------------------------------------------------------
+    def _mostrar_menu_status(self, card: ProductCard, pos: QtCore.QPoint) -> None:
         produto = card.produto
         if produto.id is None:
-            QtWidgets.QMessageBox.information(self, "Informação", "Este card não possui ID no banco de dados.")
             return
 
         menu = QtWidgets.QMenu(card)
-        for status in ("Em Desenvolvimento", "Atualizando", "Pronto"):
+        for status in ProdutoStatus.ordenados():
             action = menu.addAction(status)
             action.triggered.connect(lambda _checked=False, s=status, p=produto: self._alterar_status(p, s))
-        menu.exec(card.mapToGlobal(QPoint(10, 10)))
+        menu.exec(card.mapToGlobal(pos))
 
     def _alterar_status(self, produto: Produto, novo_status: str) -> None:
         try:
-            if produto.id is not None:
-                self._service.atualizar_status(produto.id, novo_status)
-                atualizado = replace(produto, status=novo_status)
-                self.atualizar_card(atualizado)
+            self._service.atualizar_status(produto.id, novo_status)  # type: ignore[arg-type]
         except Exception as exc:
             self.logger.exception("Falha ao alterar status do produto %s", produto.id)
             QtWidgets.QMessageBox.critical(
@@ -129,31 +128,35 @@ class PainelAdmin(BasePainelWindow):
                 "Erro ao atualizar status",
                 f"Não foi possível atualizar o status:\n{exc}",
             )
+        else:
+            self._schedule_refresh()
 
     # ------------------------------------------------------------------
     # Navegação entre módulos
     # ------------------------------------------------------------------
+    def _registrar_acesso(self, produto: Produto) -> None:
+        if produto.id is None:
+            return
+        try:
+            self._service.registrar_acesso(produto.id, self.usuario.get("usuario", ""))
+        except Exception:
+            self.logger.exception("Não foi possível registrar acesso ao produto %s", produto.id)
+
     def _abrir_modulo(self, produto: Produto) -> None:
-        nome = produto.nome
-        self.logger.info("Abrindo módulo %s", nome)
+        self.logger.info("Abrindo módulo %s", produto.nome)
+        self._registrar_acesso(produto)
 
-        if produto.id is not None:
-            try:
-                self._service.registrar_acesso(produto.id, self.user.get("usuario", ""))
-            except Exception:
-                self.logger.exception("Falha ao registrar acesso ao produto %s", produto.id)
-
-        if nome == "Manuais":
+        if produto.nome == "Manuais":
             abrir_manuais_via_qt(self)
-        elif nome == "Painel de Administração":
+        elif produto.nome == "Painel de Administração":
             self._abrir_painel_administracao()
-        elif nome == "Controle da Integração":
+        elif produto.nome == "Controle da Integração":
             self._abrir_controle_integracao()
         else:
             QtWidgets.QMessageBox.information(
                 self,
                 "Módulo não disponível",
-                f"O módulo '{nome}' ainda não foi conectado.",
+                f"O módulo '{produto.nome}' ainda não foi conectado.",
             )
 
     def _abrir_painel_administracao(self) -> None:
@@ -163,13 +166,13 @@ class PainelAdmin(BasePainelWindow):
         self._janela_admin = janela
 
     def _abrir_controle_integracao(self) -> None:
-        janela = ControleIntegracao(self.user)
+        janela = ControleIntegracao(self.usuario)
         janela.setAttribute(QtCore.Qt.WA_DeleteOnClose)
         janela.show()
         self._janela_integracao = janela
 
     # ------------------------------------------------------------------
-    # Otimizações
+    # Ciclo de vida da janela
     # ------------------------------------------------------------------
     def event(self, event):  # noqa: D401 - assinatura Qt
         if event.type() == QtCore.QEvent.WindowActivate and not self._timer.isActive():

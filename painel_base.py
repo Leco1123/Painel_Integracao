@@ -1,25 +1,25 @@
-"""Componentes base compartilhados entre os painéis de usuário e administrador."""
+"""Widgets base compartilhados pelos painéis da aplicação."""
 
 from __future__ import annotations
 
 from datetime import datetime
 import logging
-from typing import Dict, Sequence
+from typing import Dict, Iterable, Sequence
 
 from PySide6 import QtCore, QtWidgets
 
-from services.produtos_service import Produto
+from services.produtos_service import Produto, ProdutoStatus
 
 
 STATUS_COLORS = {
-    "Em Desenvolvimento": "#ff5555",
-    "Atualizando": "#ffaa00",
-    "Pronto": "#4ecca3",
+    ProdutoStatus.EM_DESENVOLVIMENTO.value: "#f87171",
+    ProdutoStatus.ATUALIZANDO.value: "#fbbf24",
+    ProdutoStatus.PRONTO.value: "#4ade80",
 }
 
 
-class PainelCard(QtWidgets.QFrame):
-    """Widget visual responsável por exibir um único produto."""
+class ProductCard(QtWidgets.QFrame):
+    """Cartão visual que representa um único produto."""
 
     activated = QtCore.Signal(Produto)
 
@@ -27,164 +27,171 @@ class PainelCard(QtWidgets.QFrame):
         super().__init__(parent)
         self.setObjectName("Card")
         self._produto = produto
-        self._build_ui()
+        self._build()
         self.update_from_produto(produto)
 
-    # ------------------------------------------------------------------
-    # Construção visual
-    # ------------------------------------------------------------------
-    def _build_ui(self) -> None:
+    def _build(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
         self.lbl_nome = QtWidgets.QLabel()
-        self.lbl_nome.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffffff;")
+        self.lbl_nome.setObjectName("CardTitle")
         layout.addWidget(self.lbl_nome)
 
         self.lbl_status = QtWidgets.QLabel()
-        self.lbl_status.setObjectName("StatusLabel")
+        self.lbl_status.setObjectName("CardStatus")
         layout.addWidget(self.lbl_status)
 
-        self.lbl_acesso = QtWidgets.QLabel()
-        layout.addWidget(self.lbl_acesso)
+        self.lbl_ultimo_acesso = QtWidgets.QLabel()
+        layout.addWidget(self.lbl_ultimo_acesso)
 
-        self.btn_abrir = QtWidgets.QPushButton("Abrir")
+        layout.addStretch(1)
+
+        self.btn_abrir = QtWidgets.QPushButton("Abrir módulo")
         self.btn_abrir.clicked.connect(self._emit_activated)
         layout.addWidget(self.btn_abrir)
 
-    # ------------------------------------------------------------------
-    # Atualizações
-    # ------------------------------------------------------------------
-    def update_from_produto(self, produto: Produto) -> None:
-        self._produto = produto
-        self.lbl_nome.setText(produto.nome)
-        status = (produto.status or "Desconhecido").strip()
-        cor = STATUS_COLORS.get(status, "#888888")
-        self.lbl_status.setText(f"Status: {status}")
-        self.lbl_status.setStyleSheet(f"color: {cor}; font-weight:bold;")
+    def mouseDoubleClickEvent(self, event):  # noqa: D401 - API Qt
+        self._emit_activated()
+        return super().mouseDoubleClickEvent(event)
 
-        acesso = BasePainelWindow.formatar_data(produto.ultimo_acesso)
-        self.lbl_acesso.setText(f"Último acesso: {acesso}")
-
-        habilitado = status.lower() == "pronto"
-        self.btn_abrir.setEnabled(habilitado)
-        if habilitado:
-            self.btn_abrir.setStyleSheet(f"background-color:{cor}; color:black; border-radius:6px; padding:6px;")
-        else:
-            self.btn_abrir.setStyleSheet("background-color:#ff5555; color:white; border-radius:6px; padding:6px;")
-
-    # ------------------------------------------------------------------
-    # Eventos
-    # ------------------------------------------------------------------
     def _emit_activated(self) -> None:
         if self.btn_abrir.isEnabled():
             self.activated.emit(self._produto)
 
-    def mouseDoubleClickEvent(self, event):  # noqa: N802 (Qt API)
-        self._emit_activated()
-        return super().mouseDoubleClickEvent(event)
+    def update_from_produto(self, produto: Produto) -> None:
+        self._produto = produto
+        self.lbl_nome.setText(produto.nome)
 
-    # ------------------------------------------------------------------
-    # Utilidades
-    # ------------------------------------------------------------------
+        status = (produto.status or "Desconhecido").strip()
+        cor = STATUS_COLORS.get(status, "#94a3b8")
+        self.lbl_status.setText(f"Status: {status}")
+        self.lbl_status.setStyleSheet(f"color: {cor}; font-weight: bold;")
+
+        ultimo_acesso = BasePainelWindow.formatar_data(produto.ultimo_acesso)
+        self.lbl_ultimo_acesso.setText(f"Último acesso: {ultimo_acesso}")
+
+        habilitado = status.lower() == ProdutoStatus.PRONTO.value.lower()
+        self.btn_abrir.setEnabled(habilitado)
+        if habilitado:
+            self.btn_abrir.setStyleSheet(
+                f"background-color: {cor}; color: black; font-weight: bold; border-radius: 6px; padding: 8px;"
+            )
+        else:
+            self.btn_abrir.setStyleSheet(
+                "background-color: #ef4444; color: white; font-weight: bold; border-radius: 6px; padding: 8px;"
+            )
+
     @property
     def produto(self) -> Produto:
         return self._produto
 
 
+class ProductGrid(QtWidgets.QWidget):
+    """Grade responsiva responsável por organizar os cartões."""
+
+    def __init__(self, *, columns: int = 3, parent: QtWidgets.QWidget | None = None):
+        super().__init__(parent)
+        self._columns = max(1, columns)
+        self._layout = QtWidgets.QGridLayout(self)
+        self._layout.setSpacing(16)
+        self._cards: Dict[str, ProductCard] = {}
+
+    def set_products(self, produtos: Sequence[Produto], *, factory) -> None:
+        self.clear()
+        for index, produto in enumerate(produtos):
+            card = factory(produto)
+            self._cards[produto.cache_key] = card
+            row, column = divmod(index, self._columns)
+            self._layout.addWidget(card, row, column)
+
+    def update_product(self, produto: Produto) -> None:
+        card = self._cards.get(produto.cache_key)
+        if card:
+            card.update_from_produto(produto)
+
+    def clear(self) -> None:
+        for card in self._cards.values():
+            card.deleteLater()
+        self._cards.clear()
+        while self._layout.count():
+            self._layout.takeAt(0)
+
+    def cards(self) -> Iterable[ProductCard]:
+        return self._cards.values()
+
+
 class BasePainelWindow(QtWidgets.QMainWindow):
-    """Janela base que encapsula layout, estilo e utilitários comuns."""
+    """Janela base compartilhada entre os painéis do sistema."""
 
     GRID_COLUMNS = 3
     STYLE = """
-        QWidget { background-color: #10121B; color: white; font-family: 'Segoe UI'; }
-        QLabel#Saudacao {
-            font-size: 22px;
-            font-weight: bold;
-            color: #4ecca3;
-            margin: 15px;
-        }
+        QWidget { background-color: #0f172a; color: #e2e8f0; font-family: 'Segoe UI'; }
+        QLabel#TituloPainel { font-size: 24px; font-weight: bold; color: #38bdf8; }
+        QLabel#RodapeStatus { font-size: 12px; color: #94a3b8; }
         QFrame#Card {
-            background-color: #1b1e2b;
-            border-radius: 10px;
-            border: 1px solid #2a2a4a;
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 12px;
             padding: 16px;
-            margin: 8px;
         }
-        QLabel { font-size: 13px; color: #ffffff; }
-        QLabel.StatusLabel { font-size: 13px; font-weight: bold; }
-        QPushButton {
-            font-weight: bold;
-            border-radius: 6px;
-            padding: 6px;
-        }
-        QLabel#RodapeStatus {
-            font-size: 12px;
-            color: #ffffff;
-        }
+        QLabel#CardTitle { font-size: 16px; font-weight: 600; color: #e2e8f0; }
+        QLabel#CardStatus { font-size: 13px; }
     """
 
-    def __init__(self, user: dict, title: str):
+    def __init__(self, usuario: dict, titulo: str):
         super().__init__()
-        self.user = user
+        self.usuario = usuario
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.cards: Dict[str, PainelCard] = {}
+        self._grid = ProductGrid(columns=self.GRID_COLUMNS)
 
-        self.setWindowTitle(title)
-        self.setGeometry(400, 150, 1100, 650)
+        self.setWindowTitle(titulo)
+        self.setMinimumSize(1100, 650)
         self.setStyleSheet(self.STYLE)
-        self._build_base_layout()
+        self._build_layout()
 
-    # ------------------------------------------------------------------
-    # Layout
-    # ------------------------------------------------------------------
-    def _build_base_layout(self) -> None:
+    def _build_layout(self) -> None:
         container = QtWidgets.QWidget()
-        layout_root = QtWidgets.QVBoxLayout(container)
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
 
-        saudacao = QtWidgets.QLabel(f"Olá, {self.user.get('nome', 'usuário')}!")
-        saudacao.setObjectName("Saudacao")
-        saudacao.setAlignment(QtCore.Qt.AlignCenter)
-        layout_root.addWidget(saudacao)
+        titulo = QtWidgets.QLabel(f"Olá, {self.usuario.get('nome', 'usuário')}!")
+        titulo.setObjectName("TituloPainel")
+        titulo.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(titulo)
 
-        self.grid = QtWidgets.QGridLayout()
-        self.grid.setSpacing(20)
-        layout_root.addLayout(self.grid)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_widget = QtWidgets.QWidget()
+        scroll_layout = QtWidgets.QVBoxLayout(scroll_widget)
+        scroll_layout.addWidget(self._grid)
+        scroll_layout.addStretch(1)
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll, stretch=1)
 
-        rodape = QtWidgets.QLabel("🟢 Conectado ao sistema_login (MariaDB)")
-        rodape.setObjectName("RodapeStatus")
-        rodape.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom)
-        layout_root.addWidget(rodape)
+        self._rodape = QtWidgets.QLabel("🔌 Aguardando conexão...")
+        self._rodape.setObjectName("RodapeStatus")
+        self._rodape.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignBottom)
+        layout.addWidget(self._rodape)
 
         self.setCentralWidget(container)
 
     # ------------------------------------------------------------------
-    # Cards
+    # API de atualização
     # ------------------------------------------------------------------
     def renderizar_produtos(self, produtos: Sequence[Produto]) -> None:
-        self._limpar_grade()
-        self.cards.clear()
+        self._grid.set_products(produtos, factory=self.criar_card)
 
-        for indice, produto in enumerate(produtos):
-            card = self.criar_card(produto)
-            self.cards[produto.cache_key] = card
-            row, col = divmod(indice, self.GRID_COLUMNS)
-            self.grid.addWidget(card, row, col)
-
-    def criar_card(self, produto: Produto) -> PainelCard:
-        return PainelCard(produto)
+    def criar_card(self, produto: Produto) -> ProductCard:
+        return ProductCard(produto)
 
     def atualizar_card(self, produto: Produto) -> None:
-        card = self.cards.get(produto.cache_key)
-        if card:
-            card.update_from_produto(produto)
+        self._grid.update_product(produto)
 
-    def _limpar_grade(self) -> None:
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
+    def atualizar_rodape(self, mensagem: str) -> None:
+        self._rodape.setText(mensagem)
 
     # ------------------------------------------------------------------
     # Utilidades
@@ -201,4 +208,4 @@ class BasePainelWindow(QtWidgets.QMainWindow):
             return str(valor)
 
 
-__all__ = ["BasePainelWindow", "PainelCard", "STATUS_COLORS"]
+__all__ = ["BasePainelWindow", "ProductCard", "ProductGrid", "STATUS_COLORS"]
