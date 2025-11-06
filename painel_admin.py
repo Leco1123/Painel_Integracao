@@ -1,10 +1,17 @@
-from PySide6 import QtWidgets, QtCore, QtGui
+import logging
+
+from PySide6 import QtWidgets, QtCore
 from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool, QPoint
-from datetime import datetime
-from database import conectar
+
+from painel_base import BasePainelCards
 from manuais_bridge import abrir_manuais_via_qt
 from painel_administracao import PainelAdministracao
 from controle_integracao.controle_integracao import ControleIntegracao
+from services.produtos_service import (
+    atualizar_status_produto,
+    obter_produtos_principais,
+    registrar_acesso_produto,
+)
 
 
 # ==========================
@@ -19,57 +26,30 @@ class ProdutosFetcher(QRunnable):
         super().__init__()
         self.fetch_fn = fetch_fn
         self.signals = ProdutosFetcherSignals()
+        self.logger = logging.getLogger(self.__class__.__name__)
 
     def run(self):
         try:
             produtos = self.fetch_fn()
             self.signals.done.emit(produtos)
         except Exception as e:
+            self.logger.exception("Falha ao buscar produtos no worker.")
             self.signals.error.emit(str(e))
 
 
-class PainelAdmin(QtWidgets.QMainWindow):
+class PainelAdmin(BasePainelCards):
     def __init__(self, user):
-        super().__init__()
-        self.user = user  # dict com nome, usuario, tipo
+        super().__init__(user, "Painel do Administrador")
         self._card_cache = {}  # {nome: {"frame":..., "lbl_status":..., "lbl_acesso":..., "btn":...}}
-        self.setWindowTitle("Painel do Administrador")
-        self.setGeometry(400, 150, 1100, 650)
 
         # Pool global para os workers
         self.pool = QThreadPool.globalInstance()
 
-        # === Estilo padrão ===
-        self.setStyleSheet("""
-            QWidget { background-color: #10121B; color: white; font-family: 'Segoe UI'; }
-            QLabel#Saudacao {
-                font-size: 22px;
-                font-weight: bold;
-                color: #4ecca3;
-                margin: 15px;
-            }
-            QFrame#Card {
-                background-color: #1b1e2b;
-                border-radius: 10px;
-                border: 1px solid #2a2a4a;
-                padding: 16px;
-                margin: 8px;
-            }
-            QLabel { font-size: 13px; color: #ffffff; }
-            QLabel.StatusLabel { font-size: 13px; font-weight: bold; }
-            QPushButton {
-                font-weight: bold;
-                border-radius: 6px;
-                padding: 6px;
-            }
-            QLabel#RodapeStatus {
-                font-size: 12px;
-                color: #ffffff;
-            }
-        """)
+        # 3) Atalhos
+        QtWidgets.QShortcut(QtCore.QKeySequence("Ctrl+R"), self, self._agendar_refresh_async)
+        QtWidgets.QShortcut(QtCore.QKeySequence("Esc"), self, self.close)
 
-        self._build_ui()
-
+        self.logger.info("Painel do Administrador inicializado para %s", self.user["usuario"])
         # Primeira carga (assíncrona)
         self._agendar_refresh_async(first_build=True)
 
@@ -79,40 +59,22 @@ class PainelAdmin(QtWidgets.QMainWindow):
         self.timer.start(3000)
 
     # ===============================================================
-    # Interface
-    # ===============================================================
-    def _build_ui(self):
-        container = QtWidgets.QWidget()
-        layout_root = QtWidgets.QVBoxLayout(container)
-
-        saudacao = QtWidgets.QLabel(f"Olá, {self.user['nome']}!")
-        saudacao.setObjectName("Saudacao")
-        saudacao.setAlignment(Qt.AlignCenter)
-        layout_root.addWidget(saudacao)
-
-        self.grid = QtWidgets.QGridLayout()
-        self.grid.setSpacing(20)
-        layout_root.addLayout(self.grid)
-
-        rodape = QtWidgets.QLabel("🟢 Conectado ao sistema_login (MariaDB)")
-        rodape.setObjectName("RodapeStatus")
-        rodape.setAlignment(Qt.AlignRight | Qt.AlignBottom)
-        layout_root.addWidget(rodape)
-
-        # 3) Atalhos
-        QtWidgets.QShortcut(QtCore.QKeySequence("Ctrl+R"), self, self._agendar_refresh_async)
-        QtWidgets.QShortcut(QtCore.QKeySequence("Esc"), self, self.close)
-
-        self.setCentralWidget(container)
-
-    # ===============================================================
     # 1) Refresh assíncrono
     # ===============================================================
     def _agendar_refresh_async(self, first_build: bool = False):
+        self.logger.debug("Agendando refresh dos produtos (first_build=%s)", first_build)
         worker = ProdutosFetcher(self._buscar_produtos_fixos)
         worker.signals.done.connect(lambda produtos: self._aplicar_produtos(produtos, first_build))
-        worker.signals.error.connect(lambda msg: print("[PainelAdmin] Erro no fetch:", msg))
+        worker.signals.error.connect(self._exibir_erro_fetch)
         self.pool.start(worker)
+
+    def _exibir_erro_fetch(self, mensagem: str) -> None:
+        self.logger.error("Erro ao atualizar lista de produtos: %s", mensagem)
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Erro ao buscar produtos",
+            f"Não foi possível carregar os produtos:\n{mensagem}",
+        )
 
     def _aplicar_produtos(self, produtos: list, first_build: bool = False):
         # Garante o "Painel de Administração"
@@ -156,75 +118,7 @@ class PainelAdmin(QtWidgets.QMainWindow):
     # 4) Buscar produtos (compatível com pool em database.conectar)
     # ===============================================================
     def _buscar_produtos_fixos(self):
-        nomes_fixos = [
-            "Controle da Integração",
-            "Macro da Regina",
-            "Macro da Folha",
-            "Macro do Fiscal",
-            "Formatador de Balancete",
-            "Manuais"
-        ]
-        try:
-            with conectar() as conn:
-                cursor = conn.cursor(dictionary=True)
-                cursor.execute("""
-                    SELECT id, nome, status, ultimo_acesso FROM produtos
-                    WHERE nome IN (
-                        'Controle da Integração',
-                        'Macro da Regina',
-                        'Macro da Folha',
-                        'Macro do Fiscal',
-                        'Formatador de Balancete',
-                        'Manuais'
-                    )
-                    ORDER BY FIELD(nome,
-                        'Controle da Integração',
-                        'Macro da Regina',
-                        'Macro da Folha',
-                        'Macro do Fiscal',
-                        'Formatador de Balancete',
-                        'Manuais');
-                """)
-                produtos = cursor.fetchall()
-
-                # insere faltantes de uma vez
-                nomes_banco = {p["nome"] for p in produtos}
-                faltando = [n for n in nomes_fixos if n not in nomes_banco]
-                if faltando:
-                    cur2 = conn.cursor()
-                    for nome_modulo in faltando:
-                        cur2.execute(
-                            "INSERT IGNORE INTO produtos (nome, status, ultimo_acesso) VALUES (%s, 'Pronto', NULL)",
-                            (nome_modulo,)
-                        )
-                    conn.commit()
-                    cur2.close()
-
-                    cursor.execute("""
-                        SELECT id, nome, status, ultimo_acesso FROM produtos
-                        WHERE nome IN (
-                            'Controle da Integração',
-                            'Macro da Regina',
-                            'Macro da Folha',
-                            'Macro do Fiscal',
-                            'Formatador de Balancete',
-                            'Manuais'
-                        )
-                        ORDER BY FIELD(nome,
-                            'Controle da Integração',
-                            'Macro da Regina',
-                            'Macro da Folha',
-                            'Macro do Fiscal',
-                            'Formatador de Balancete',
-                            'Manuais');
-                    """)
-                    produtos = cursor.fetchall()
-
-                cursor.close()
-                return produtos
-        except Exception as e:
-            print("[PainelAdmin] Erro ao buscar produtos:", e)
-            return []
+        return obter_produtos_principais()
 
     # ===============================================================
     # Cards + 2) Menu de contexto
@@ -246,7 +140,9 @@ class PainelAdmin(QtWidgets.QMainWindow):
         lbl_status.setStyleSheet(f"color:{cor_status}; font-weight:bold;")
         lay.addWidget(lbl_status)
 
-        lbl_acesso = QtWidgets.QLabel(f"Último acesso: {self._formatar_data(produto.get('ultimo_acesso'))}")
+        lbl_acesso = QtWidgets.QLabel(
+            f"Último acesso: {self.formatar_data(produto.get('ultimo_acesso'))}"
+        )
         lay.addWidget(lbl_acesso)
 
         btn = QtWidgets.QPushButton("Abrir")
@@ -281,7 +177,9 @@ class PainelAdmin(QtWidgets.QMainWindow):
         cor_status = {"Em Desenvolvimento": "#ff5555", "Atualizando": "#ffaa00", "Pronto": "#4ecca3"}.get(status, "#888")
         card["lbl_status"].setText(f"Status: {status}")
         card["lbl_status"].setStyleSheet(f"color:{cor_status}; font-weight:bold;")
-        card["lbl_acesso"].setText(f"Último acesso: {self._formatar_data(produto.get('ultimo_acesso'))}")
+        card["lbl_acesso"].setText(
+            f"Último acesso: {self.formatar_data(produto.get('ultimo_acesso'))}"
+        )
 
         if status.lower() != "pronto" and produto["nome"].lower() != "painel de administração":
             card["btn"].setEnabled(False)
@@ -296,11 +194,7 @@ class PainelAdmin(QtWidgets.QMainWindow):
             if produto.get("id", -1) == -1:
                 QtWidgets.QMessageBox.information(self, "Aviso", "Este card é virtual e não possui ID no banco.")
                 return
-            with conectar() as conn:
-                cur = conn.cursor()
-                cur.execute("UPDATE produtos SET status=%s WHERE id=%s", (novo_status, produto["id"]))
-                conn.commit()
-                cur.close()
+            atualizar_status_produto(produto["id"], novo_status)
             # feedback visual imediato
             produto["status"] = novo_status
             card = self._card_cache.get(produto["nome"])
@@ -308,38 +202,21 @@ class PainelAdmin(QtWidgets.QMainWindow):
                 self._atualizar_card(card, produto)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Erro", f"Não foi possível atualizar o status:\n{e}")
-
-    # ===============================================================
-    # Utils
-    # ===============================================================
-    def _formatar_data(self, valor):
-        if not valor:
-            return "-"
-        if isinstance(valor, datetime):
-            return valor.strftime("%d/%m/%Y %H:%M")
-        try:
-            return datetime.fromisoformat(str(valor).replace("Z", "").split(".")[0]).strftime("%d/%m/%Y %H:%M")
-        except Exception:
-            return str(valor)
+            self.logger.exception("Falha ao atualizar status do produto %s", produto.get("id"))
 
     # ===============================================================
     # Roteamento
     # ===============================================================
     def _abrir_modulo(self, produto):
         nome = produto["nome"]
-        print(f"[PainelAdmin] Clicou em '{nome}'")
+        self.logger.info("Ação de abrir módulo: %s", nome)
 
         try:
             if produto.get("id", -1) != -1:
-                with conectar() as conn:
-                    cur = conn.cursor()
-                    cur.execute("UPDATE produtos SET ultimo_acesso = NOW() WHERE id = %s", (produto["id"],))
-                    cur.execute("INSERT INTO acessos (usuario, produto_id) VALUES (%s, %s)",
-                                (self.user["usuario"], produto["id"]))
-                    conn.commit()
-                    cur.close()
+                registrar_acesso_produto(produto["id"], self.user["usuario"])
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao registrar acesso:\n{e}")
+            self.logger.exception("Falha ao registrar acesso do módulo %s", produto.get("id"))
             return
 
         if nome == "Manuais":

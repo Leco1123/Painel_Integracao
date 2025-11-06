@@ -1,49 +1,15 @@
 from PySide6 import QtWidgets, QtCore
-from PySide6.QtCore import Qt
-from datetime import datetime
-from database import conectar
+
+from painel_base import BasePainelCards
 from manuais_bridge import abrir_manuais_via_qt
 from controle_integracao.controle_integracao import ControleIntegracao  # 🔗 integração total
+from services.produtos_service import obter_produtos_principais, registrar_acesso_produto
 
 
-class PainelUser(QtWidgets.QMainWindow):
+class PainelUser(BasePainelCards):
     def __init__(self, user):
-        super().__init__()
-        self.user = user  # dict com nome, usuario, tipo
-
-        self.setWindowTitle("Painel do Usuário")
-        self.setGeometry(400, 150, 1100, 650)
-
-        # === Estilo padrão ===
-        self.setStyleSheet("""
-            QWidget { background-color: #10121B; color: white; font-family: 'Segoe UI'; }
-            QLabel#Saudacao {
-                font-size: 22px;
-                font-weight: bold;
-                color: #4ecca3;
-                margin: 15px;
-            }
-            QFrame#Card {
-                background-color: #1b1e2b;
-                border-radius: 10px;
-                border: 1px solid #2a2a4a;
-                padding: 16px;
-                margin: 8px;
-            }
-            QLabel { font-size: 13px; color: #ffffff; }
-            QLabel.StatusLabel { font-size: 13px; font-weight: bold; }
-            QPushButton {
-                font-weight: bold;
-                border-radius: 6px;
-                padding: 6px;
-            }
-            QLabel#RodapeStatus {
-                font-size: 12px;
-                color: #ffffff;
-            }
-        """)
-
-        self._build_ui()
+        super().__init__(user, "Painel do Usuário")
+        self.logger.info("Painel do Usuário inicializado para %s", self.user["usuario"])
         self._preencher_cards()
 
         # Atualização automática dos cards
@@ -52,102 +18,21 @@ class PainelUser(QtWidgets.QMainWindow):
         self.timer.start(3000)
 
     # ===============================================================
-    # Construção da interface
-    # ===============================================================
-    def _build_ui(self):
-        container = QtWidgets.QWidget()
-        layout_root = QtWidgets.QVBoxLayout(container)
-
-        # Saudação no topo
-        saudacao = QtWidgets.QLabel(f"Olá, {self.user['nome']}!")
-        saudacao.setObjectName("Saudacao")
-        saudacao.setAlignment(Qt.AlignCenter)
-        layout_root.addWidget(saudacao)
-
-        # Grade 2 colunas × 3 linhas
-        self.grid = QtWidgets.QGridLayout()
-        self.grid.setSpacing(20)
-        layout_root.addLayout(self.grid)
-
-        # Rodapé
-        rodape = QtWidgets.QLabel("🟢 Conectado ao sistema_login (MariaDB)")
-        rodape.setObjectName("RodapeStatus")
-        rodape.setAlignment(Qt.AlignRight | Qt.AlignBottom)
-        layout_root.addWidget(rodape)
-
-        self.setCentralWidget(container)
-
-    # ===============================================================
     # Atualiza os cards
     # ===============================================================
     def _preencher_cards(self):
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-
-        produtos = self._buscar_produtos_fixos()
-
-        for idx, produto in enumerate(produtos):
-            row = idx // 3
-            col = idx % 3
-            card = self._criar_card(produto)
-            self.grid.addWidget(card, row, col)
-
-    def _buscar_produtos_fixos(self):
-        nomes_fixos = [
-            "Controle da Integração",
-            "Macro da Regina",
-            "Macro da Folha",
-            "Macro do Fiscal",
-            "Formatador de Balancete",
-            "Manuais"
-        ]
         try:
-            conn = conectar()
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("""
-                SELECT id, nome, status, ultimo_acesso FROM produtos
-                WHERE nome IN (
-                    'Controle da Integração',
-                    'Macro da Regina',
-                    'Macro da Folha',
-                    'Macro do Fiscal',
-                    'Formatador de Balancete',
-                    'Manuais'
-                )
-                ORDER BY FIELD(nome,
-                    'Controle da Integração',
-                    'Macro da Regina',
-                    'Macro da Folha',
-                    'Macro do Fiscal',
-                    'Formatador de Balancete',
-                    'Manuais');
-            """)
-            produtos = cursor.fetchall()
-            cursor.close()
-            conn.close()
+            produtos = obter_produtos_principais()
+        except Exception as exc:
+            self.logger.exception("Falha ao carregar produtos no painel do usuário.")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Erro ao buscar produtos",
+                f"Não foi possível carregar os produtos:\n{exc}",
+            )
+            produtos = []
 
-            nomes_ja_no_banco = [p["nome"] for p in produtos]
-            faltando = [n for n in nomes_fixos if n not in nomes_ja_no_banco]
-            if faltando:
-                conn = conectar()
-                cursor = conn.cursor()
-                for nome_modulo in faltando:
-                    cursor.execute(
-                        "INSERT INTO produtos (nome, status, ultimo_acesso) VALUES (%s, 'Pronto', NULL)",
-                        (nome_modulo,)
-                    )
-                conn.commit()
-                cursor.close()
-                conn.close()
-                return self._buscar_produtos_fixos()
-
-            return produtos
-        except Exception as e:
-            print("Erro ao buscar produtos:", e)
-            return []
+        self.preencher_grade(produtos, self._criar_card)
 
     # ===============================================================
     # Criação dos cards
@@ -177,9 +62,9 @@ class PainelUser(QtWidgets.QMainWindow):
         lay.addWidget(lbl_status)
 
         # Último acesso
-        ultimo = produto["ultimo_acesso"]
-        data_fmt = datetime.strftime(ultimo, "%d/%m/%Y %H:%M") if ultimo else "-"
-        lbl_acesso = QtWidgets.QLabel(f"Último acesso: {data_fmt}")
+        lbl_acesso = QtWidgets.QLabel(
+            f"Último acesso: {self.formatar_data(produto.get('ultimo_acesso'))}"
+        )
         lay.addWidget(lbl_acesso)
 
         # Botão
@@ -202,22 +87,18 @@ class PainelUser(QtWidgets.QMainWindow):
     def _abrir_modulo(self, produto):
         nome_modulo = produto["nome"]
         status_modulo = (produto["status"] or "").strip().lower()
-        print(f"[PainelUser] Clicou em '{nome_modulo}' (status={status_modulo})")
+        self.logger.info("Usuário solicitou módulo '%s' (status=%s)", nome_modulo, status_modulo)
 
         # Log de acesso
         try:
-            conn = conectar()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE produtos SET ultimo_acesso = NOW() WHERE id = %s", (produto["id"],))
-            cursor.execute(
-                "INSERT INTO acessos (usuario, produto_id) VALUES (%s, %s)",
-                (self.user["usuario"], produto["id"])
-            )
-            conn.commit()
-            cursor.close()
-            conn.close()
+            registrar_acesso_produto(produto["id"], self.user["usuario"])
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao registrar acesso:\n{e}")
+            self.logger.exception(
+                "Falha ao registrar acesso do usuário %s ao produto %s",
+                self.user["usuario"],
+                produto.get("id"),
+            )
             return
 
         # Abre os módulos

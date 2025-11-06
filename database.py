@@ -1,17 +1,63 @@
 # database.py
+import logging
 import os
-from mysql.connector import pooling, Error
+from pathlib import Path
+from typing import Dict
 
-# -----------------------------------------
-# Config
-# -----------------------------------------
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "user": os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASS", "int123!"),
-    "database": os.getenv("DB_NAME", "sistema_login"),
-    "port": int(os.getenv("DB_PORT", 3306)),
-}
+from mysql.connector import Error, pooling
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _load_dotenv() -> None:
+    """Carrega um arquivo .env localizado ao lado do projeto, se existir."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def _build_db_config() -> Dict[str, object]:
+    _load_dotenv()
+
+    defaults = {
+        "DB_HOST": "localhost",
+        "DB_USER": "root",
+        "DB_PASS": "int123!",
+        "DB_NAME": "sistema_login",
+        "DB_PORT": "3306",
+    }
+
+    missing_values = [key for key in defaults if not os.getenv(key)]
+    for key in missing_values:
+        os.environ.setdefault(key, defaults[key])
+
+    if missing_values:
+        LOGGER.warning(
+            "Variáveis de ambiente ausentes (%s); usando valores padrão.",
+            ", ".join(sorted(missing_values)),
+        )
+
+    config: Dict[str, object] = {
+        "host": os.environ["DB_HOST"],
+        "user": os.environ["DB_USER"],
+        "password": os.environ["DB_PASS"],
+        "database": os.environ["DB_NAME"],
+        "port": int(os.environ.get("DB_PORT", defaults["DB_PORT"])),
+    }
+    return config
+
+
+DB_CONFIG = _build_db_config()
+
 
 # -----------------------------------------
 # Pool
@@ -21,11 +67,11 @@ try:
         pool_name="painel_pool",
         pool_size=5,
         pool_reset_session=True,
-        **DB_CONFIG
+        **DB_CONFIG,
     )
-    print("[DB] Pool de conexões iniciado.")
-except Error as e:
-    print(f"[ERRO BANCO] Falha ao criar pool: {e}")
+    LOGGER.info("Pool de conexões iniciado com sucesso.")
+except Error as exc:
+    LOGGER.exception("Falha ao criar pool de conexões.")
     _POOL = None
 
 
